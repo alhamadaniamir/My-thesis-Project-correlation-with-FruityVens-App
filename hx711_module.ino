@@ -1,8 +1,8 @@
 #include "HX711.h"
 
 // Update these pins to match your wiring.
-const int HX711_DOUT_PIN = 3;
-const int HX711_SCK_PIN = 2;
+const int HX711_DOUT_PIN = 23;
+const int HX711_SCK_PIN = 22;
 
 // Replace this with your load cell calibration factor after calibration.
 float calibrationFactor = 2280.0f;
