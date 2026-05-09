@@ -1,0 +1,45 @@
+#include "HX711.h"
+
+// Update these pins to match your wiring.
+const int HX711_DOUT_PIN = 3;
+const int HX711_SCK_PIN = 2;
+
+// Replace this with your load cell calibration factor after calibration.
+float calibrationFactor = 2280.0f;
+
+HX711 scale;
+
+void setup() {
+  Serial.begin(9600);
+
+  scale.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+
+  Serial.println("HX711 load cell test");
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 not found. Check wiring.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("Remove all weight from the scale.");
+  delay(3000);
+
+  scale.set_scale();
+  scale.tare();
+
+  Serial.println("Tare complete.");
+  scale.set_scale(calibrationFactor);
+  Serial.println("Reading weight in grams...");
+}
+
+void loop() {
+  float weight = scale.get_units(10);
+
+  Serial.print("Weight: ");
+  Serial.print(weight, 2);
+  Serial.println(" g");
+
+  delay(500);
+}
