@@ -9,7 +9,8 @@ float calibrationFactor = 2280.0f;
 
 HX711 scale;
 
-void setup() {
+void setup() 
+{
   Serial.begin(9600);
 
   scale.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
@@ -34,7 +35,8 @@ void setup() {
   Serial.println("Reading weight in grams...");
 }
 
-void loop() {
+void loop() 
+{
   float weight = scale.get_units(10);
 
   Serial.print("Weight: ");
