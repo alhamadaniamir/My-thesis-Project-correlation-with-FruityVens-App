@@ -44,6 +44,7 @@ float pricePerKg = 60.0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastHx711UpdateMs = 0;
 float currentWeightGrams = 0.0;
+long hx711UpdateCount = 0;
 
 bool successWasPressed = false;
 bool cancelWasPressed = false;
@@ -57,8 +58,10 @@ float readWeightGrams() {
   return round(w * 10.0) / 10.0;
 }
 
-float readSignalValue(float weightGrams) {
-  return weightGrams * calibration_factor;
+void printScaleHelp() {
+  Serial.println("HX711 commands:");
+  Serial.println("  t = tare/zero the scale");
+  Serial.println("If weight stays 0.0, remove all load, press t, then add weight.");
 }
 
 void setupScale() {
@@ -70,6 +73,7 @@ void setupScale() {
   Serial.println(HX_DOUT);
   Serial.print("HX711 SCK GPIO: ");
   Serial.println(HX_SCK);
+  Serial.println("Remove all weight before startup tare.");
 
   EEPROM.begin(512);
   EEPROM.get(calVal_eepromAddress, calibration_factor);
@@ -83,6 +87,7 @@ void setupScale() {
 
   LoadCell.begin();
   LoadCell.setSamplesInUse(4);
+
   unsigned long stabilizingtime = 2000;
   boolean tare = true;
   LoadCell.start(stabilizingtime, tare);
@@ -106,6 +111,7 @@ void setupScale() {
   lastHx711UpdateMs = millis();
   hx711Ready = true;
   Serial.println("Scale ready");
+  printScaleHelp();
 }
 
 void setupRtc() {
@@ -138,7 +144,7 @@ void setupWifi() {
     Serial.println("WiFi OK");
   } else {
     Serial.println("WiFi FAILED");
-  } 
+  }
 }
 
 void syncRtcFromNtp() {
@@ -174,8 +180,6 @@ void updateDisplay(float weightGrams) {
   float billableWeightGrams = weightGrams;
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = (billableWeightGrams / 1000.0) * pricePerKg;
-  float signalValue = readSignalValue(weightGrams);
-
   char line[21];
 
   snprintf(line, sizeof(line), "Weight:%8.1f g", weightGrams);
@@ -186,7 +190,7 @@ void updateDisplay(float weightGrams) {
   } else if (millis() - lastHx711UpdateMs > 2000) {
     snprintf(line, sizeof(line), "No data DOUT:%d", digitalRead(HX_DOUT));
   } else {
-    snprintf(line, sizeof(line), "Signal:%8.0f", signalValue);
+    snprintf(line, sizeof(line), "HX711 updates:%6ld", hx711UpdateCount);
   }
   printPadded(0, 1, line);
 
@@ -204,18 +208,12 @@ void updateDisplay(float weightGrams) {
 }
 
 void handleButtons(float weightGrams) {
+  if (!hx711Ready) {
+    return;
+  }
+
   bool successPressed = digitalRead(BTN_SUCCESS) == LOW;
   bool cancelPressed = digitalRead(BTN_CANCEL) == LOW;
-
-  if (successPressed && cancelPressed) {
-    Serial.println("Both buttons detected - check wiring");
-    lcd.clear();
-    lcd.print("Both buttons ON");
-    lcd.setCursor(0, 1);
-    lcd.print("Check GPIO 12/14");
-    delay(1200);
-    lcd.clear();
-  }
 
   if (successPressed && !cancelPressed && !successWasPressed) {
     float billableWeightGrams = weightGrams;
@@ -236,23 +234,13 @@ void handleButtons(float weightGrams) {
   }
 
   if (cancelPressed && !successPressed && !cancelWasPressed) {
-    if (!hx711Ready) {
-      Serial.println("Cannot tare - HX711 is not ready");
-      lcd.clear();
-      lcd.print("HX711 not ready");
-      delay(1200);
-      lcd.clear();
-      successWasPressed = successPressed;
-      cancelWasPressed = cancelPressed;
-      return;
-    }
-
     Serial.println("Cancelled - tare scale");
     lcd.clear();
     lcd.print("Cancelled");
     lcd.setCursor(0, 1);
     lcd.print("Taring scale...");
     LoadCell.tareNoDelay();
+
     unsigned long tareStartMs = millis();
     while (!LoadCell.getTareStatus()) {
       LoadCell.update();
@@ -267,6 +255,7 @@ void handleButtons(float weightGrams) {
         return;
       }
     }
+
     lcd.setCursor(0, 2);
     lcd.print("Scale zeroed");
     delay(1200);
@@ -292,15 +281,17 @@ void setup() {
   lcd.backlight();
   lcd.print("Initializing...");
 
-  setupScale();
-
   setupRtc();
-
   setupWifi();
   syncRtcFromNtp();
+  setupScale();
 
   lcd.clear();
-  lcd.print("Ready!");
+  if (hx711Ready) {
+    lcd.print("Ready!");
+  } else {
+    lcd.print("Scale not ready");
+  }
   delay(1000);
   lcd.clear();
 }
@@ -309,25 +300,43 @@ void loop() {
   if (hx711Ready && LoadCell.update()) {
     lastHx711UpdateMs = millis();
     currentWeightGrams = readWeightGrams();
+    hx711UpdateCount++;
     newWeightReady = true;
   }
 
   handleButtons(currentWeightGrams);
 
+  if (hx711Ready && Serial.available() > 0) {
+    char command = Serial.read();
+    if (command == 't' || command == 'T') {
+      Serial.println("Serial tare requested");
+      LoadCell.tareNoDelay();
+    }
+  }
+
+  if (hx711Ready && LoadCell.getTareStatus()) {
+    currentWeightGrams = 0;
+    Serial.println("Tare complete");
+  }
+
   if (millis() - lastDisplayMs >= 500) {
     Serial.print("Weight(g): ");
     Serial.println(currentWeightGrams, 1);
+    Serial.print("HX711 update count: ");
+    Serial.println(hx711UpdateCount);
+
     if (newWeightReady) {
-      Serial.print("Signal estimate: ");
-      Serial.println(readSignalValue(currentWeightGrams), 0);
+      Serial.println("New HX711 data received");
       newWeightReady = false;
     } else {
       Serial.print("No new HX711 data. DOUT pin level: ");
       Serial.println(digitalRead(HX_DOUT));
     }
+
     if (!hx711Ready || millis() - lastHx711UpdateMs > 2000) {
       Serial.println("HX711 not updating - check DOUT/SCK wiring, power, and shared ground.");
     }
+
     updateDisplay(currentWeightGrams);
     lastDisplayMs = millis();
   }
