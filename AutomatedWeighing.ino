@@ -31,10 +31,18 @@ const int calVal_eepromAddress = 0;
 
 const float DEFAULT_CALIBRATION_FACTOR = 1.0;
 const float pricePerKg = 60.0;
-const unsigned long DISPLAY_INTERVAL_MS = 500;
+const unsigned long DISPLAY_INTERVAL_MS = 1000;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
+const unsigned long STABLE_LOCK_MS = 900;
+const float OBJECT_DETECT_GRAMS = 5.0;
+const float OBJECT_REMOVE_GRAMS = 2.0;
+const float STABLE_DELTA_GRAMS = 1.5;
+const float NOISE_FLOOR_GRAMS = 2.0;
+const float WEIGHT_FILTER_ALPHA = 0.25;
+const uint8_t OBJECT_CONFIRM_SAMPLES = 3;
+const uint8_t REMOVE_CONFIRM_SAMPLES = 4;
 
 hd44780_I2Cexp lcd(0x27);
 HX711_ADC LoadCell(HX_DOUT, HX_SCK);
@@ -56,12 +64,20 @@ float calibration_factor = DEFAULT_CALIBRATION_FACTOR;
 float currentWeightGrams = 0.0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastHx711UpdateMs = 0;
-unsigned long lastButtonDebugMs = 0;
 unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
 unsigned long messageUntilMs = 0;
+unsigned long stableSinceMs = 0;
+float lastLiveWeightGrams = 0.0;
+float lockedWeightGrams = 0.0;
+float filteredWeightGrams = 0.0;
 bool hx711Ready = false;
 bool rtcReady = false;
+bool weightLocked = false;
+bool objectPresent = false;
+bool newScaleData = false;
+uint8_t objectDetectCount = 0;
+uint8_t objectRemoveCount = 0;
 
 bool isValidCalibrationFactor(float value) {
   return !isnan(value) && !isinf(value) && fabs(value) >= 0.1 && fabs(value) <= 1000000.0;
@@ -143,9 +159,14 @@ float readWeightGrams() {
     return currentWeightGrams;
   }
 
-  if (weight < 0) weight = 0;
-  if (fabs(weight) < 1.0) weight = 0;
-  return round(weight * 10.0) / 10.0;
+  weight = fabs(weight);
+  if (weight < NOISE_FLOOR_GRAMS) weight = 0;
+
+  filteredWeightGrams =
+    (WEIGHT_FILTER_ALPHA * weight) + ((1.0 - WEIGHT_FILTER_ALPHA) * filteredWeightGrams);
+  if (filteredWeightGrams < NOISE_FLOOR_GRAMS) filteredWeightGrams = 0;
+
+  return round(filteredWeightGrams * 10.0) / 10.0;
 }
 
 void showMessage(const char* line1, const char* line2 = "") {
@@ -168,9 +189,86 @@ void tareScale(const char* reason) {
   while (!LoadCell.getTareStatus()) {
     LoadCell.update();
   }
+  weightLocked = false;
+  objectPresent = false;
+  lockedWeightGrams = 0.0;
+  lastLiveWeightGrams = 0.0;
+  filteredWeightGrams = 0.0;
+  objectDetectCount = 0;
+  objectRemoveCount = 0;
+  stableSinceMs = 0;
   currentWeightGrams = 0.0;
   showMessage("Scale zeroed");
   Serial.println("Tare complete");
+}
+
+void updateLockedWeight() {
+  if (!hx711Ready || !newScaleData) return;
+  newScaleData = false;
+
+  float liveWeightGrams = readWeightGrams();
+  unsigned long nowMs = millis();
+
+  if (weightLocked) {
+    currentWeightGrams = lockedWeightGrams;
+    if (liveWeightGrams <= OBJECT_REMOVE_GRAMS) {
+      if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
+    } else {
+      objectRemoveCount = 0;
+    }
+
+    if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
+      weightLocked = false;
+      objectPresent = false;
+      lockedWeightGrams = 0.0;
+      currentWeightGrams = 0.0;
+      stableSinceMs = 0;
+      lastLiveWeightGrams = 0.0;
+      filteredWeightGrams = 0.0;
+      objectDetectCount = 0;
+      objectRemoveCount = 0;
+      Serial.println("Object removed - zero display resumed");
+    }
+    return;
+  }
+
+  if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
+    objectPresent = false;
+    currentWeightGrams = 0.0;
+    stableSinceMs = 0;
+    lastLiveWeightGrams = liveWeightGrams;
+    objectDetectCount = 0;
+    objectRemoveCount = 0;
+    return;
+  }
+
+  if (objectDetectCount < OBJECT_CONFIRM_SAMPLES) {
+    objectDetectCount++;
+    currentWeightGrams = 0.0;
+    lastLiveWeightGrams = liveWeightGrams;
+    return;
+  }
+
+  objectPresent = true;
+  objectRemoveCount = 0;
+  currentWeightGrams = liveWeightGrams;
+  if (fabs(liveWeightGrams - lastLiveWeightGrams) <= STABLE_DELTA_GRAMS) {
+    if (stableSinceMs == 0) {
+      stableSinceMs = nowMs;
+    }
+
+    if (nowMs - stableSinceMs >= STABLE_LOCK_MS) {
+      lockedWeightGrams = liveWeightGrams;
+      currentWeightGrams = lockedWeightGrams;
+      weightLocked = true;
+      Serial.print("Weight locked(g): ");
+      Serial.println(lockedWeightGrams, 1);
+    }
+  } else {
+    stableSinceMs = nowMs;
+  }
+
+  lastLiveWeightGrams = liveWeightGrams;
 }
 
 void setupScale() {
@@ -283,9 +381,13 @@ void updateDisplay() {
   snprintf(line, sizeof(line), "Price: PHP %7.2f", price);
   printPadded(0, 1, line);
 
-  snprintf(line, sizeof(line), "Btn S:%d C:%d",
-           digitalRead(BTN_SUCCESS) == HIGH,
-           digitalRead(BTN_CANCEL) == HIGH);
+  if (weightLocked) {
+    snprintf(line, sizeof(line), "Status: locked");
+  } else if (objectPresent) {
+    snprintf(line, sizeof(line), "Status: weighing");
+  } else {
+    snprintf(line, sizeof(line), "Status: zero");
+  }
   printPadded(0, 2, line);
 
   if (rtcReady) {
@@ -359,6 +461,9 @@ void processSerialCommand() {
     }
     LoadCell.refreshDataSet();
     saveCalibrationFactor(LoadCell.getNewCalibration(knownWeightGrams));
+    weightLocked = false;
+    objectPresent = false;
+    lockedWeightGrams = 0.0;
     currentWeightGrams = readWeightGrams();
     return;
   }
@@ -399,18 +504,23 @@ void setup() {
 void loop() {
   if (hx711Ready && LoadCell.update()) {
     lastHx711UpdateMs = millis();
+    newScaleData = true;
   }
 
-  if (hx711Ready && millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
-    currentWeightGrams = readWeightGrams();
+  if (hx711Ready) {
+    updateLockedWeight();
   }
 
   handleButtons();
   processSerialCommand();
 
   if (millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
-    Serial.print("Weight(g): ");
-    Serial.println(currentWeightGrams, 2);
+    if (objectPresent || weightLocked) {
+      Serial.print("Weight(g): ");
+      Serial.println(currentWeightGrams, 2);
+    } else {
+      Serial.println("Weight(g): 0.00");
+    }
     Serial.print("Calibration factor: ");
     Serial.println(calibration_factor, 6);
     if (hx711Ready && millis() - lastHx711UpdateMs > 2000) {
