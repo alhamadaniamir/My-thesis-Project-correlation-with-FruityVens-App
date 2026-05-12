@@ -38,17 +38,16 @@ const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
-const unsigned long STABLE_LOCK_MS = 450;
 const unsigned long TARE_TIMEOUT_MS = 5000;
 const float OBJECT_DETECT_GRAMS = 5.0;
 const float OBJECT_REMOVE_GRAMS = 2.0;
-const float STABLE_DELTA_GRAMS = 2.5;
 const float NOISE_FLOOR_GRAMS = 2.0;
 const float WEIGHT_FILTER_ALPHA = 0.45;
 const float FAST_WEIGHT_FILTER_ALPHA = 0.85;
 const float FAST_WEIGHT_DELTA_GRAMS = 20.0;
 const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
 const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
+const uint8_t LOCK_MATCH_SAMPLES = 10;
 
 hd44780_I2Cexp lcd(0x27);
 HX711_ADC LoadCell(HX_DOUT, HX_SCK);
@@ -73,8 +72,7 @@ unsigned long lastHx711UpdateMs = 0;
 unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
 unsigned long messageUntilMs = 0;
-unsigned long stableSinceMs = 0;
-float lastLiveWeightGrams = 0.0;
+float lastLockCandidateGrams = 0.0;
 float lockedWeightGrams = 0.0;
 float filteredWeightGrams = 0.0;
 bool hx711Ready = false;
@@ -84,6 +82,7 @@ bool objectPresent = false;
 bool newScaleData = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
+uint8_t lockMatchCount = 0;
 
 bool isValidCalibrationFactor(float value) {
   return !isnan(value) && !isinf(value) && fabs(value) >= 0.0001 && fabs(value) <= 1000000.0;
@@ -135,11 +134,11 @@ void resetWeightState() {
   objectPresent = false;
   lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
-  lastLiveWeightGrams = 0.0;
+  lastLockCandidateGrams = 0.0;
   filteredWeightGrams = 0.0;
   objectDetectCount = 0;
   objectRemoveCount = 0;
-  stableSinceMs = 0;
+  lockMatchCount = 0;
 }
 
 void persistCalibrationFactor(float value) {
@@ -241,7 +240,6 @@ void updateLockedWeight() {
   newScaleData = false;
 
   float liveWeightGrams = readWeightGrams();
-  unsigned long nowMs = millis();
 
   if (weightLocked) {
     currentWeightGrams = lockedWeightGrams;
@@ -261,40 +259,38 @@ void updateLockedWeight() {
   if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
     objectPresent = false;
     currentWeightGrams = 0.0;
-    stableSinceMs = 0;
-    lastLiveWeightGrams = liveWeightGrams;
     objectDetectCount = 0;
     objectRemoveCount = 0;
+    lockMatchCount = 0;
+    lastLockCandidateGrams = 0.0;
     return;
   }
 
   if (objectDetectCount < OBJECT_CONFIRM_SAMPLES) {
     objectDetectCount++;
     currentWeightGrams = 0.0;
-    lastLiveWeightGrams = liveWeightGrams;
+    lockMatchCount = 1;
+    lastLockCandidateGrams = liveWeightGrams;
     return;
   }
 
   objectPresent = true;
   objectRemoveCount = 0;
   currentWeightGrams = liveWeightGrams;
-  if (fabs(liveWeightGrams - lastLiveWeightGrams) <= STABLE_DELTA_GRAMS) {
-    if (stableSinceMs == 0) {
-      stableSinceMs = nowMs;
-    }
-
-    if (nowMs - stableSinceMs >= STABLE_LOCK_MS) {
-      lockedWeightGrams = liveWeightGrams;
-      currentWeightGrams = lockedWeightGrams;
-      weightLocked = true;
-      Serial.print("Weight locked(g): ");
-      Serial.println(lockedWeightGrams, 1);
-    }
+  if (liveWeightGrams == lastLockCandidateGrams) {
+    if (lockMatchCount < LOCK_MATCH_SAMPLES) lockMatchCount++;
   } else {
-    stableSinceMs = nowMs;
+    lastLockCandidateGrams = liveWeightGrams;
+    lockMatchCount = 1;
   }
 
-  lastLiveWeightGrams = liveWeightGrams;
+  if (lockMatchCount >= LOCK_MATCH_SAMPLES) {
+    lockedWeightGrams = liveWeightGrams;
+    currentWeightGrams = lockedWeightGrams;
+    weightLocked = true;
+    Serial.print("Weight locked(g): ");
+    Serial.println(lockedWeightGrams, 1);
+  }
 }
 
 void setupScale() {
