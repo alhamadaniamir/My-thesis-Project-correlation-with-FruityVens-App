@@ -30,20 +30,25 @@ const int LCD_ROWS = 4;
 const int calVal_eepromAddress = 0;
 
 const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0;
-const float DEFAULT_CALIBRATION_FACTOR = 0.1012;
+const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
+const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
+const float CALIBRATION_STEP = 0.001;
 const float pricePerKg = 60.0;
-const unsigned long DISPLAY_INTERVAL_MS = 1000;
+const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
-const unsigned long STABLE_LOCK_MS = 900;
+const unsigned long STABLE_LOCK_MS = 450;
+const unsigned long TARE_TIMEOUT_MS = 5000;
 const float OBJECT_DETECT_GRAMS = 5.0;
 const float OBJECT_REMOVE_GRAMS = 2.0;
-const float STABLE_DELTA_GRAMS = 1.5;
+const float STABLE_DELTA_GRAMS = 2.5;
 const float NOISE_FLOOR_GRAMS = 2.0;
-const float WEIGHT_FILTER_ALPHA = 0.25;
-const uint8_t OBJECT_CONFIRM_SAMPLES = 3;
-const uint8_t REMOVE_CONFIRM_SAMPLES = 4;
+const float WEIGHT_FILTER_ALPHA = 0.45;
+const float FAST_WEIGHT_FILTER_ALPHA = 0.85;
+const float FAST_WEIGHT_DELTA_GRAMS = 20.0;
+const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
+const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
 
 hd44780_I2Cexp lcd(0x27);
 HX711_ADC LoadCell(HX_DOUT, HX_SCK);
@@ -81,7 +86,7 @@ uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
 
 bool isValidCalibrationFactor(float value) {
-  return !isnan(value) && !isinf(value) && fabs(value) >= 0.1 && fabs(value) <= 1000000.0;
+  return !isnan(value) && !isinf(value) && fabs(value) >= 0.0001 && fabs(value) <= 1000000.0;
 }
 
 void printPadded(uint8_t col, uint8_t row, const char* text) {
@@ -100,16 +105,16 @@ void beginButton(ButtonState &button) {
   button.lastRawChangeMs = millis();
 }
 
-bool updateButton(ButtonState &button) {
+bool updateButton(ButtonState &button, unsigned long nowMs) {
   bool rawPressed = digitalRead(button.pin) == LOW;
 
   if (rawPressed != button.rawPressed) {
     button.rawPressed = rawPressed;
-    button.lastRawChangeMs = millis();
+    button.lastRawChangeMs = nowMs;
   }
 
   button.previousStablePressed = button.stablePressed;
-  if (millis() - button.lastRawChangeMs >= BUTTON_DEBOUNCE_MS) {
+  if (nowMs - button.lastRawChangeMs >= BUTTON_DEBOUNCE_MS) {
     button.stablePressed = button.rawPressed;
   }
 
@@ -125,6 +130,23 @@ bool updateButton(ButtonState &button) {
   return false;
 }
 
+void resetWeightState() {
+  weightLocked = false;
+  objectPresent = false;
+  lockedWeightGrams = 0.0;
+  currentWeightGrams = 0.0;
+  lastLiveWeightGrams = 0.0;
+  filteredWeightGrams = 0.0;
+  objectDetectCount = 0;
+  objectRemoveCount = 0;
+  stableSinceMs = 0;
+}
+
+void persistCalibrationFactor(float value) {
+  EEPROM.put(calVal_eepromAddress, value);
+  EEPROM.commit();
+}
+
 void saveCalibrationFactor(float value) {
   if (!isValidCalibrationFactor(value)) {
     Serial.println("Invalid calibration factor, not saved.");
@@ -133,8 +155,7 @@ void saveCalibrationFactor(float value) {
 
   calibration_factor = value;
   LoadCell.setCalFactor(calibration_factor);
-  EEPROM.put(calVal_eepromAddress, calibration_factor);
-  EEPROM.commit();
+  persistCalibrationFactor(calibration_factor);
   Serial.print("Calibration factor saved: ");
   Serial.println(calibration_factor, 6);
 }
@@ -163,19 +184,29 @@ float readWeightGrams() {
   weight = fabs(weight);
   if (weight < NOISE_FLOOR_GRAMS) weight = 0;
 
+  if (filteredWeightGrams == 0.0 && weight >= OBJECT_DETECT_GRAMS) {
+    filteredWeightGrams = weight;
+    return round(filteredWeightGrams * 10.0) / 10.0;
+  }
+
+  float filterAlpha = WEIGHT_FILTER_ALPHA;
+  if (fabs(weight - filteredWeightGrams) >= FAST_WEIGHT_DELTA_GRAMS) {
+    filterAlpha = FAST_WEIGHT_FILTER_ALPHA;
+  }
+
   filteredWeightGrams =
-    (WEIGHT_FILTER_ALPHA * weight) + ((1.0 - WEIGHT_FILTER_ALPHA) * filteredWeightGrams);
+    (filterAlpha * weight) + ((1.0 - filterAlpha) * filteredWeightGrams);
   if (filteredWeightGrams < NOISE_FLOOR_GRAMS) filteredWeightGrams = 0;
 
   return round(filteredWeightGrams * 10.0) / 10.0;
 }
 
-void showMessage(const char* line1, const char* line2 = "") {
+void showMessage(const char* line1, const char* line2 = "", unsigned long nowMs = millis()) {
   lcd.clear();
   lcd.print(line1);
   lcd.setCursor(0, 1);
   lcd.print(line2);
-  messageUntilMs = millis() + MESSAGE_DISPLAY_MS;
+  messageUntilMs = nowMs + MESSAGE_DISPLAY_MS;
 }
 
 void tareScale(const char* reason) {
@@ -187,18 +218,20 @@ void tareScale(const char* reason) {
   Serial.println(reason);
   showMessage("Taring scale...");
   LoadCell.tareNoDelay();
-  while (!LoadCell.getTareStatus()) {
+  unsigned long tareStartedMs = millis();
+  bool tareComplete = false;
+  while (!tareComplete && millis() - tareStartedMs < TARE_TIMEOUT_MS) {
     LoadCell.update();
+    tareComplete = LoadCell.getTareStatus();
   }
-  weightLocked = false;
-  objectPresent = false;
-  lockedWeightGrams = 0.0;
-  lastLiveWeightGrams = 0.0;
-  filteredWeightGrams = 0.0;
-  objectDetectCount = 0;
-  objectRemoveCount = 0;
-  stableSinceMs = 0;
-  currentWeightGrams = 0.0;
+
+  if (!tareComplete) {
+    showMessage("Tare failed", "Check scale");
+    Serial.println("Tare timeout - check scale stability and wiring");
+    return;
+  }
+
+  resetWeightState();
   showMessage("Scale zeroed");
   Serial.println("Tare complete");
 }
@@ -219,15 +252,7 @@ void updateLockedWeight() {
     }
 
     if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
-      weightLocked = false;
-      objectPresent = false;
-      lockedWeightGrams = 0.0;
-      currentWeightGrams = 0.0;
-      stableSinceMs = 0;
-      lastLiveWeightGrams = 0.0;
-      filteredWeightGrams = 0.0;
-      objectDetectCount = 0;
-      objectRemoveCount = 0;
+      resetWeightState();
       Serial.println("Object removed - zero display resumed");
     }
     return;
@@ -280,12 +305,13 @@ void setupScale() {
   EEPROM.get(calVal_eepromAddress, calibration_factor);
   if (!isValidCalibrationFactor(calibration_factor)) {
     calibration_factor = DEFAULT_CALIBRATION_FACTOR;
-    EEPROM.put(calVal_eepromAddress, calibration_factor);
-    EEPROM.commit();
+    persistCalibrationFactor(calibration_factor);
   } else if (fabs(calibration_factor - OLD_DEFAULT_CALIBRATION_FACTOR) < 0.0001) {
     calibration_factor = DEFAULT_CALIBRATION_FACTOR;
-    EEPROM.put(calVal_eepromAddress, calibration_factor);
-    EEPROM.commit();
+    persistCalibrationFactor(calibration_factor);
+  } else if (fabs(calibration_factor - PREVIOUS_CALIBRATION_FACTOR) < 0.0001) {
+    calibration_factor = DEFAULT_CALIBRATION_FACTOR;
+    persistCalibrationFactor(calibration_factor);
   }
 
   Serial.println("Starting HX711...");
@@ -406,9 +432,9 @@ void updateDisplay() {
 }
 
 void handleButtons() {
-  bool successPressed = updateButton(successButton);
-  bool cancelPressed = updateButton(cancelButton);
   unsigned long nowMs = millis();
+  bool successPressed = updateButton(successButton, nowMs);
+  bool cancelPressed = updateButton(cancelButton, nowMs);
 
   if (successPressed && nowMs - lastSuccessActionMs >= BUTTON_COOLDOWN_MS) {
     lastSuccessActionMs = nowMs;
@@ -422,7 +448,7 @@ void handleButtons() {
 
     char line2[21];
     snprintf(line2, sizeof(line2), "PHP %.2f", price);
-    showMessage("Sale confirmed", line2);
+    showMessage("Sale confirmed", line2, nowMs);
   }
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
@@ -444,12 +470,12 @@ void processSerialCommand() {
   }
 
   if (command == "+" || command == "a" || command == "A") {
-    saveCalibrationFactor(calibration_factor + 1.0);
+    saveCalibrationFactor(calibration_factor + CALIBRATION_STEP);
     return;
   }
 
   if (command == "-" || command == "z" || command == "Z") {
-    saveCalibrationFactor(calibration_factor - 1.0);
+    saveCalibrationFactor(calibration_factor - CALIBRATION_STEP);
     return;
   }
 
@@ -466,9 +492,7 @@ void processSerialCommand() {
     }
     LoadCell.refreshDataSet();
     saveCalibrationFactor(LoadCell.getNewCalibration(knownWeightGrams));
-    weightLocked = false;
-    objectPresent = false;
-    lockedWeightGrams = 0.0;
+    resetWeightState();
     currentWeightGrams = readWeightGrams();
     return;
   }
