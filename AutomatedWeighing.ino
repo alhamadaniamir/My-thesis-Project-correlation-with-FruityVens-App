@@ -29,7 +29,8 @@ const int LCD_COLS = 20;
 const int LCD_ROWS = 4;
 const int calVal_eepromAddress = 0;
 
-const float DEFAULT_CALIBRATION_FACTOR = 1.0;
+const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0;
+const float DEFAULT_CALIBRATION_FACTOR = 0.1012;
 const float pricePerKg = 60.0;
 const unsigned long DISPLAY_INTERVAL_MS = 1000;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
@@ -278,6 +279,10 @@ void setupScale() {
   EEPROM.begin(512);
   EEPROM.get(calVal_eepromAddress, calibration_factor);
   if (!isValidCalibrationFactor(calibration_factor)) {
+    calibration_factor = DEFAULT_CALIBRATION_FACTOR;
+    EEPROM.put(calVal_eepromAddress, calibration_factor);
+    EEPROM.commit();
+  } else if (fabs(calibration_factor - OLD_DEFAULT_CALIBRATION_FACTOR) < 0.0001) {
     calibration_factor = DEFAULT_CALIBRATION_FACTOR;
     EEPROM.put(calVal_eepromAddress, calibration_factor);
     EEPROM.commit();
