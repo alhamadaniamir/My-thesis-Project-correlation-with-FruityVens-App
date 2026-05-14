@@ -17,6 +17,7 @@
 
 #define BTN_SUCCESS 12
 #define BTN_CANCEL 14
+#define BUZZER_PIN 26
 
 const char* ssid = "Aida_iPhone";
 const char* password = "1234567899";
@@ -39,6 +40,9 @@ const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
 const unsigned long TARE_TIMEOUT_MS = 5000;
+const unsigned int BUZZER_FREQUENCY_HZ = 3000;
+const unsigned int BUZZER_BEEP_MS = 220;
+const unsigned int BUZZER_PAUSE_MS = 120;
 const float OBJECT_DETECT_GRAMS = 5.0;
 const float OBJECT_REMOVE_GRAMS = 2.0;
 const float NOISE_FLOOR_GRAMS = 2.0;
@@ -127,6 +131,18 @@ bool updateButton(ButtonState &button, unsigned long nowMs) {
   }
 
   return false;
+}
+
+void beepBuzzer(uint8_t beepCount) {
+  for (uint8_t i = 0; i < beepCount; i++) {
+    tone(BUZZER_PIN, BUZZER_FREQUENCY_HZ);
+    delay(BUZZER_BEEP_MS);
+    noTone(BUZZER_PIN);
+
+    if (i + 1 < beepCount) {
+      delay(BUZZER_PAUSE_MS);
+    }
+  }
 }
 
 void resetWeightState() {
@@ -445,10 +461,12 @@ void handleButtons() {
     char line2[21];
     snprintf(line2, sizeof(line2), "PHP %.2f", price);
     showMessage("Sale confirmed", line2, nowMs);
+    beepBuzzer(1);
   }
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
     lastCancelActionMs = nowMs;
+    beepBuzzer(2);
     tareScale("Cancel button tare");
   }
 }
@@ -502,6 +520,8 @@ void setup() {
 
   pinMode(BTN_SUCCESS, INPUT_PULLUP);
   pinMode(BTN_CANCEL, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
   delay(20);
   beginButton(successButton);
   beginButton(cancelButton);
