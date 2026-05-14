@@ -40,7 +40,6 @@ const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
 const unsigned long TARE_TIMEOUT_MS = 5000;
-const unsigned int BUZZER_FREQUENCY_HZ = 3000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 const float OBJECT_DETECT_GRAMS = 5.0;
@@ -135,9 +134,9 @@ bool updateButton(ButtonState &button, unsigned long nowMs) {
 
 void beepBuzzer(uint8_t beepCount) {
   for (uint8_t i = 0; i < beepCount; i++) {
-    tone(BUZZER_PIN, BUZZER_FREQUENCY_HZ);
+    digitalWrite(BUZZER_PIN, HIGH);
     delay(BUZZER_BEEP_MS);
-    noTone(BUZZER_PIN);
+    digitalWrite(BUZZER_PIN, LOW);
 
     if (i + 1 < beepCount) {
       delay(BUZZER_PAUSE_MS);
@@ -466,6 +465,7 @@ void handleButtons() {
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
     lastCancelActionMs = nowMs;
+    showMessage("Cancelled", "", nowMs);
     beepBuzzer(2);
     tareScale("Cancel button tare");
   }
@@ -521,7 +521,7 @@ void setup() {
   pinMode(BTN_SUCCESS, INPUT_PULLUP);
   pinMode(BTN_CANCEL, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
   delay(20);
   beginButton(successButton);
   beginButton(cancelButton);
