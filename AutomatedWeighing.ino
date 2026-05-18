@@ -4,6 +4,7 @@
 #include <HX711_ADC.h>
 #include <EEPROM.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <RTClib.h>
 #include "time.h"
 #include <math.h>
@@ -51,10 +52,23 @@ const float FAST_WEIGHT_DELTA_GRAMS = 20.0;
 const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
 const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
 const uint8_t LOCK_MATCH_SAMPLES = 10;
+const size_t SALE_HISTORY_SIZE = 10;
+
+struct SaleRecord {
+  unsigned long id;
+  float weightGrams;
+  float price;
+  char fruitType[32];
+  char timestamp[25];
+  char date[11];
+  char time[9];
+  char source[16];
+};
 
 hd44780_I2Cexp lcd(0x27);
 HX711_ADC LoadCell(HX_DOUT, HX_SCK);
 RTC_DS3231 rtc;
+WebServer server(80);
 
 struct ButtonState {
   uint8_t pin;
@@ -86,6 +100,61 @@ bool newScaleData = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
 uint8_t lockMatchCount = 0;
+unsigned long nextSaleId = 1;
+unsigned long latestSaleId = 0;
+size_t saleHistoryCount = 0;
+SaleRecord saleHistory[SALE_HISTORY_SIZE];
+char currentFruitType[32] = "Unknown";
+
+SaleRecord recordSale(const char* source);
+String saleRecordJson(const SaleRecord& sale);
+
+float calculatePrice(float weightGrams) {
+  if (weightGrams < 0) weightGrams = 0;
+  return (weightGrams / 1000.0) * pricePerKg;
+}
+
+const char* scaleStatusText() {
+  if (weightLocked) return "locked";
+  if (objectPresent) return "weighing";
+  return "zero";
+}
+
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void sendJson(int statusCode, const String& body) {
+  sendCorsHeaders();
+  server.send(statusCode, "application/json", body);
+}
+
+String jsonEscape(const char* value) {
+  String escaped = "";
+  for (size_t i = 0; value[i] != '\0'; i++) {
+    char c = value[i];
+    if (c == '"' || c == '\\') {
+      escaped += '\\';
+      escaped += c;
+    } else if (c == '\n') {
+      escaped += "\\n";
+    } else if (c == '\r') {
+      escaped += "\\r";
+    } else if (c == '\t') {
+      escaped += "\\t";
+    } else {
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
+void handleOptions() {
+  sendCorsHeaders();
+  server.send(204);
+}
 
 bool isValidCalibrationFactor(float value) {
   return !isnan(value) && !isinf(value) && fabs(value) >= 0.0001 && fabs(value) <= 1000000.0;
@@ -250,6 +319,36 @@ void tareScale(const char* reason) {
   Serial.println("Tare complete");
 }
 
+SaleRecord confirmSale(const char* reason, const char* source) {
+  SaleRecord sale = recordSale(source);
+
+  Serial.print(reason);
+  Serial.print(" - Sale ID: ");
+  Serial.print(sale.id);
+  Serial.print(" Fruit: ");
+  Serial.print(sale.fruitType);
+  Serial.print(" - Weight(g): ");
+  Serial.print(sale.weightGrams, 2);
+  Serial.print(" Price: ");
+  Serial.print(sale.price, 2);
+  Serial.print(" Timestamp: ");
+  Serial.println(sale.timestamp);
+  Serial.print("SALE_DATA ");
+  Serial.println(saleRecordJson(sale));
+
+  char line2[21];
+  snprintf(line2, sizeof(line2), "PHP %.2f", sale.price);
+  showMessage("Sale confirmed", line2);
+  beepBuzzer(1);
+  return sale;
+}
+
+void cancelSale(const char* reason) {
+  showMessage("Cancelled");
+  beepBuzzer(2);
+  tareScale(reason);
+}
+
 void updateLockedWeight() {
   if (!hx711Ready || !newScaleData) return;
   newScaleData = false;
@@ -410,10 +509,219 @@ void syncRtcFromNtp() {
   Serial.println("RTC synced from NTP");
 }
 
+String currentTimestamp() {
+  if (!rtcReady) return "";
+
+  DateTime now = rtc.now();
+  char timestamp[25];
+  snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02d",
+           now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  return String(timestamp);
+}
+
+void copyCurrentDateTime(char* timestampDestination, size_t timestampSize,
+                         char* dateDestination, size_t dateSize,
+                         char* timeDestination, size_t timeSize) {
+  if (timestampSize > 0) timestampDestination[0] = '\0';
+  if (dateSize > 0) dateDestination[0] = '\0';
+  if (timeSize > 0) timeDestination[0] = '\0';
+
+  if (!rtcReady) {
+    if (timestampSize > 0) snprintf(timestampDestination, timestampSize, "unknown");
+    if (dateSize > 0) snprintf(dateDestination, dateSize, "unknown");
+    if (timeSize > 0) snprintf(timeDestination, timeSize, "unknown");
+    return;
+  }
+
+  DateTime now = rtc.now();
+  if (timestampSize > 0) {
+    snprintf(timestampDestination, timestampSize, "%04d-%02d-%02dT%02d:%02d:%02d",
+             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  }
+  if (dateSize > 0) {
+    snprintf(dateDestination, dateSize, "%04d-%02d-%02d",
+             now.year(), now.month(), now.day());
+  }
+  if (timeSize > 0) {
+    snprintf(timeDestination, timeSize, "%02d:%02d:%02d",
+             now.hour(), now.minute(), now.second());
+  }
+}
+
+String saleRecordJson(const SaleRecord& sale) {
+  String body = "{";
+  body += "\"id\":";
+  body += String(sale.id);
+  body += ",\"weightGrams\":";
+  body += String(sale.weightGrams, 2);
+  body += ",\"weight\":";
+  body += String(sale.weightGrams, 2);
+  body += ",\"weightKg\":";
+  body += String(sale.weightGrams / 1000.0, 3);
+  body += ",\"price\":";
+  body += String(sale.price, 2);
+  body += ",\"pricePerKg\":";
+  body += String(pricePerKg, 2);
+  body += ",\"fruitType\":\"";
+  body += jsonEscape(sale.fruitType);
+  body += "\",\"fruit\":\"";
+  body += jsonEscape(sale.fruitType);
+  body += "\",\"fruit_type\":\"";
+  body += jsonEscape(sale.fruitType);
+  body += "\",\"timestamp\":\"";
+  body += jsonEscape(sale.timestamp);
+  body += "\",\"date\":\"";
+  body += jsonEscape(sale.date);
+  body += "\",\"time\":\"";
+  body += jsonEscape(sale.time);
+  body += "\",\"source\":\"";
+  body += jsonEscape(sale.source);
+  body += "\"}";
+  return body;
+}
+
+SaleRecord recordSale(const char* source) {
+  SaleRecord sale = {};
+  sale.id = nextSaleId++;
+  sale.weightGrams = currentWeightGrams;
+  sale.price = calculatePrice(currentWeightGrams);
+  strlcpy(sale.fruitType, currentFruitType, sizeof(sale.fruitType));
+  strlcpy(sale.source, source, sizeof(sale.source));
+  copyCurrentDateTime(sale.timestamp, sizeof(sale.timestamp),
+                      sale.date, sizeof(sale.date),
+                      sale.time, sizeof(sale.time));
+
+  saleHistory[latestSaleId % SALE_HISTORY_SIZE] = sale;
+  latestSaleId = sale.id;
+  if (saleHistoryCount < SALE_HISTORY_SIZE) {
+    saleHistoryCount++;
+  }
+
+  return sale;
+}
+
+void handleStatusRequest() {
+  String body = "{";
+  body += "\"ready\":";
+  body += hx711Ready ? "true" : "false";
+  body += ",\"weightGrams\":";
+  body += String(currentWeightGrams, 2);
+  body += ",\"price\":";
+  body += String(calculatePrice(currentWeightGrams), 2);
+  body += ",\"pricePerKg\":";
+  body += String(pricePerKg, 2);
+  body += ",\"status\":\"";
+  body += scaleStatusText();
+  body += "\",\"fruitType\":\"";
+  body += jsonEscape(currentFruitType);
+  body += "\",\"latestSaleId\":";
+  body += String(latestSaleId);
+  body += ",\"rtcReady\":";
+  body += rtcReady ? "true" : "false";
+  body += ",\"timestamp\":\"";
+  body += currentTimestamp();
+  body += "\",\"date\":\"";
+  char date[11];
+  char time[9];
+  char timestamp[25];
+  copyCurrentDateTime(timestamp, sizeof(timestamp), date, sizeof(date), time, sizeof(time));
+  body += jsonEscape(date);
+  body += "\",\"time\":\"";
+  body += jsonEscape(time);
+  body += "\",\"ip\":\"";
+  body += WiFi.localIP().toString();
+  body += "\"}";
+
+  sendJson(200, body);
+}
+
+void handleTareRequest() {
+  tareScale("App tare");
+  handleStatusRequest();
+}
+
+void handleConfirmRequest() {
+  SaleRecord sale = confirmSale("APP SALE OK", "app");
+  sendJson(200, saleRecordJson(sale));
+}
+
+void handleLatestSaleRequest() {
+  if (latestSaleId == 0) {
+    sendJson(404, "{\"error\":\"No confirmed sale yet\"}");
+    return;
+  }
+
+  for (size_t i = 0; i < saleHistoryCount; i++) {
+    if (saleHistory[i].id == latestSaleId) {
+      sendJson(200, saleRecordJson(saleHistory[i]));
+      return;
+    }
+  }
+
+  sendJson(404, "{\"error\":\"Latest sale not available\"}");
+}
+
+void handleSalesRequest() {
+  String body = "[";
+  bool first = true;
+  for (size_t i = 0; i < saleHistoryCount; i++) {
+    if (saleHistory[i].id == 0) continue;
+    if (!first) body += ",";
+    body += saleRecordJson(saleHistory[i]);
+    first = false;
+  }
+  body += "]";
+  sendJson(200, body);
+}
+
+void handleFruitRequest() {
+  String fruit = server.arg("type");
+  if (fruit.length() == 0 && server.hasArg("plain")) {
+    fruit = server.arg("plain");
+  }
+  fruit.trim();
+
+  if (fruit.length() == 0) {
+    sendJson(400, "{\"error\":\"Missing fruit type\"}");
+    return;
+  }
+
+  fruit.toCharArray(currentFruitType, sizeof(currentFruitType));
+  handleStatusRequest();
+}
+
+void handleCancelRequest() {
+  cancelSale("App cancel tare");
+  handleStatusRequest();
+}
+
+void setupApiServer() {
+  server.on("/", HTTP_GET, handleStatusRequest);
+  server.on("/status", HTTP_GET, handleStatusRequest);
+  server.on("/tare", HTTP_POST, handleTareRequest);
+  server.on("/confirm", HTTP_POST, handleConfirmRequest);
+  server.on("/cancel", HTTP_POST, handleCancelRequest);
+  server.on("/fruit", HTTP_POST, handleFruitRequest);
+  server.on("/sale/latest", HTTP_GET, handleLatestSaleRequest);
+  server.on("/sales", HTTP_GET, handleSalesRequest);
+  server.onNotFound([]() {
+    if (server.method() == HTTP_OPTIONS) {
+      handleOptions();
+      return;
+    }
+    sendJson(404, "{\"error\":\"Not found\"}");
+  });
+  server.begin();
+
+  Serial.print("Scale API: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/status");
+}
+
 void updateDisplay() {
   float billableWeightGrams = currentWeightGrams;
   if (billableWeightGrams < 0) billableWeightGrams = 0;
-  float price = (billableWeightGrams / 1000.0) * pricePerKg;
+  float price = calculatePrice(billableWeightGrams);
 
   char line[21];
 
@@ -449,25 +757,12 @@ void handleButtons() {
 
   if (successPressed && nowMs - lastSuccessActionMs >= BUTTON_COOLDOWN_MS) {
     lastSuccessActionMs = nowMs;
-    float price = (currentWeightGrams / 1000.0) * pricePerKg;
-    if (price < 0) price = 0;
-
-    Serial.print("SALE OK - Weight(g): ");
-    Serial.print(currentWeightGrams, 2);
-    Serial.print(" Price: ");
-    Serial.println(price, 2);
-
-    char line2[21];
-    snprintf(line2, sizeof(line2), "PHP %.2f", price);
-    showMessage("Sale confirmed", line2, nowMs);
-    beepBuzzer(1);
+    confirmSale("SALE OK", "scale");
   }
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
     lastCancelActionMs = nowMs;
-    showMessage("Cancelled", "", nowMs);
-    beepBuzzer(2);
-    tareScale("Cancel button tare");
+    cancelSale("Cancel button tare");
   }
 }
 
@@ -542,6 +837,7 @@ void setup() {
   setupWifi();
   syncRtcFromNtp();
   setupScale();
+  setupApiServer();
 
   showMessage(hx711Ready ? "Ready!" : "Scale not ready");
 }
@@ -558,6 +854,7 @@ void loop() {
 
   handleButtons();
   processSerialCommand();
+  server.handleClient();
 
   if (millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
     if (objectPresent || weightLocked) {
