@@ -108,6 +108,7 @@ char currentFruitType[32] = "Unknown";
 
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
+String saleRecordJson(const SaleRecord& sale, const String& indent);
 
 float calculatePrice(float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
@@ -149,6 +150,15 @@ String jsonEscape(const char* value) {
     }
   }
   return escaped;
+}
+
+String errorJson(const char* message) {
+  String body = "{\n";
+  body += "  \"error\": \"";
+  body += jsonEscape(message);
+  body += "\"\n";
+  body += "}";
+  return body;
 }
 
 void handleOptions() {
@@ -549,34 +559,64 @@ void copyCurrentDateTime(char* timestampDestination, size_t timestampSize,
 }
 
 String saleRecordJson(const SaleRecord& sale) {
-  String body = "{";
-  body += "\"id\":";
+  return saleRecordJson(sale, "  ");
+}
+
+String saleRecordJson(const SaleRecord& sale, const String& indent) {
+  String body = "{\n";
+  body += indent;
+  body += "\"id\": ";
   body += String(sale.id);
-  body += ",\"weightGrams\":";
+  body += ",\n";
+  body += indent;
+  body += "\"weightGrams\": ";
   body += String(sale.weightGrams, 2);
-  body += ",\"weight\":";
+  body += ",\n";
+  body += indent;
+  body += "\"weight\": ";
   body += String(sale.weightGrams, 2);
-  body += ",\"weightKg\":";
+  body += ",\n";
+  body += indent;
+  body += "\"weightKg\": ";
   body += String(sale.weightGrams / 1000.0, 3);
-  body += ",\"price\":";
+  body += ",\n";
+  body += indent;
+  body += "\"price\": ";
   body += String(sale.price, 2);
-  body += ",\"pricePerKg\":";
+  body += ",\n";
+  body += indent;
+  body += "\"pricePerKg\": ";
   body += String(pricePerKg, 2);
-  body += ",\"fruitType\":\"";
+  body += ",\n";
+  body += indent;
+  body += "\"fruitType\": \"";
   body += jsonEscape(sale.fruitType);
-  body += "\",\"fruit\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"fruit\": \"";
   body += jsonEscape(sale.fruitType);
-  body += "\",\"fruit_type\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"fruit_type\": \"";
   body += jsonEscape(sale.fruitType);
-  body += "\",\"timestamp\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"timestamp\": \"";
   body += jsonEscape(sale.timestamp);
-  body += "\",\"date\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"date\": \"";
   body += jsonEscape(sale.date);
-  body += "\",\"time\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"time\": \"";
   body += jsonEscape(sale.time);
-  body += "\",\"source\":\"";
+  body += "\",\n";
+  body += indent;
+  body += "\"source\": \"";
   body += jsonEscape(sale.source);
-  body += "\"}";
+  body += "\"\n";
+  body += "}";
   return body;
 }
 
@@ -591,46 +631,53 @@ SaleRecord recordSale(const char* source) {
                       sale.date, sizeof(sale.date),
                       sale.time, sizeof(sale.time));
 
-  saleHistory[latestSaleId % SALE_HISTORY_SIZE] = sale;
   latestSaleId = sale.id;
-  if (saleHistoryCount < SALE_HISTORY_SIZE) {
-    saleHistoryCount++;
+  if (saleHistoryCount >= SALE_HISTORY_SIZE) {
+    for (size_t i = 1; i < SALE_HISTORY_SIZE; i++) {
+      saleHistory[i - 1] = saleHistory[i];
+    }
+    saleHistoryCount = SALE_HISTORY_SIZE - 1;
   }
+  saleHistory[saleHistoryCount] = sale;
+  saleHistoryCount++;
 
   return sale;
 }
 
 void handleStatusRequest() {
-  String body = "{";
-  body += "\"ready\":";
+  String body = "{\n";
+  body += "  \"ready\": ";
   body += hx711Ready ? "true" : "false";
-  body += ",\"weightGrams\":";
+  body += ",\n  \"weightGrams\": ";
   body += String(currentWeightGrams, 2);
-  body += ",\"price\":";
+  body += ",\n  \"price\": ";
   body += String(calculatePrice(currentWeightGrams), 2);
-  body += ",\"pricePerKg\":";
+  body += ",\n  \"pricePerKg\": ";
   body += String(pricePerKg, 2);
-  body += ",\"status\":\"";
+  body += ",\n  \"status\": \"";
   body += scaleStatusText();
-  body += "\",\"fruitType\":\"";
+  body += "\",\n  \"fruitType\": \"";
   body += jsonEscape(currentFruitType);
-  body += "\",\"latestSaleId\":";
+  body += "\",\n  \"latestSaleId\": ";
   body += String(latestSaleId);
-  body += ",\"rtcReady\":";
+  body += ",\n  \"pendingSales\": ";
+  body += String(saleHistoryCount);
+  body += ",\n  \"rtcReady\": ";
   body += rtcReady ? "true" : "false";
-  body += ",\"timestamp\":\"";
+  body += ",\n  \"timestamp\": \"";
   body += currentTimestamp();
-  body += "\",\"date\":\"";
+  body += "\",\n  \"date\": \"";
   char date[11];
   char time[9];
   char timestamp[25];
   copyCurrentDateTime(timestamp, sizeof(timestamp), date, sizeof(date), time, sizeof(time));
   body += jsonEscape(date);
-  body += "\",\"time\":\"";
+  body += "\",\n  \"time\": \"";
   body += jsonEscape(time);
-  body += "\",\"ip\":\"";
+  body += "\",\n  \"ip\": \"";
   body += WiFi.localIP().toString();
-  body += "\"}";
+  body += "\"\n";
+  body += "}";
 
   sendJson(200, body);
 }
@@ -646,19 +693,12 @@ void handleConfirmRequest() {
 }
 
 void handleLatestSaleRequest() {
-  if (latestSaleId == 0) {
-    sendJson(404, "{\"error\":\"No confirmed sale yet\"}");
+  if (saleHistoryCount == 0) {
+    sendJson(404, errorJson("No pending confirmed sale yet"));
     return;
   }
 
-  for (size_t i = 0; i < saleHistoryCount; i++) {
-    if (saleHistory[i].id == latestSaleId) {
-      sendJson(200, saleRecordJson(saleHistory[i]));
-      return;
-    }
-  }
-
-  sendJson(404, "{\"error\":\"Latest sale not available\"}");
+  sendJson(200, saleRecordJson(saleHistory[saleHistoryCount - 1]));
 }
 
 void handleSalesRequest() {
@@ -666,12 +706,84 @@ void handleSalesRequest() {
   bool first = true;
   for (size_t i = 0; i < saleHistoryCount; i++) {
     if (saleHistory[i].id == 0) continue;
-    if (!first) body += ",";
-    body += saleRecordJson(saleHistory[i]);
+    if (first) {
+      body += "\n";
+    } else {
+      body += ",\n";
+    }
+    body += "  ";
+    body += saleRecordJson(saleHistory[i], "    ");
     first = false;
+  }
+  if (!first) {
+    body += "\n";
   }
   body += "]";
   sendJson(200, body);
+}
+
+bool requestAcknowledgesSale(const String& body, unsigned long saleId) {
+  unsigned long value = 0;
+  bool readingNumber = false;
+
+  for (unsigned int i = 0; i < body.length(); i++) {
+    const char c = body.charAt(i);
+    if (c >= '0' && c <= '9') {
+      readingNumber = true;
+      value = (value * 10) + (c - '0');
+      continue;
+    }
+
+    if (readingNumber) {
+      if (value == saleId) {
+        return true;
+      }
+      value = 0;
+      readingNumber = false;
+    }
+  }
+
+  return readingNumber && value == saleId;
+}
+
+size_t acknowledgeSales(const String& body) {
+  size_t acknowledged = 0;
+  size_t kept = 0;
+
+  for (size_t i = 0; i < saleHistoryCount; i++) {
+    if (requestAcknowledgesSale(body, saleHistory[i].id)) {
+      acknowledged++;
+      continue;
+    }
+    if (kept != i) {
+      saleHistory[kept] = saleHistory[i];
+    }
+    kept++;
+  }
+
+  for (size_t i = kept; i < saleHistoryCount; i++) {
+    saleHistory[i] = SaleRecord{};
+  }
+  saleHistoryCount = kept;
+  return acknowledged;
+}
+
+void handleSalesAckRequest() {
+  String body = server.hasArg("plain") ? server.arg("plain") : "";
+  body.trim();
+  if (body.length() == 0) {
+    sendJson(400, errorJson("Missing acknowledged sale IDs"));
+    return;
+  }
+
+  const size_t acknowledged = acknowledgeSales(body);
+  String response = "{\n";
+  response += "  \"acknowledged\": ";
+  response += String(acknowledged);
+  response += ",\n  \"pendingSales\": ";
+  response += String(saleHistoryCount);
+  response += "\n}";
+  sendJson(200, response);
 }
 
 void handleFruitRequest() {
@@ -682,7 +794,7 @@ void handleFruitRequest() {
   fruit.trim();
 
   if (fruit.length() == 0) {
-    sendJson(400, "{\"error\":\"Missing fruit type\"}");
+    sendJson(400, errorJson("Missing fruit type"));
     return;
   }
 
@@ -704,12 +816,13 @@ void setupApiServer() {
   server.on("/fruit", HTTP_POST, handleFruitRequest);
   server.on("/sale/latest", HTTP_GET, handleLatestSaleRequest);
   server.on("/sales", HTTP_GET, handleSalesRequest);
+  server.on("/sales/ack", HTTP_POST, handleSalesAckRequest);
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
       handleOptions();
       return;
     }
-    sendJson(404, "{\"error\":\"Not found\"}");
+    sendJson(404, errorJson("Not found"));
   });
   server.begin();
 
