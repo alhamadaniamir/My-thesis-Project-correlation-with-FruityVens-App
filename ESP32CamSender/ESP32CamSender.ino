@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_camera.h>
+#include "img_converters.h"
 
 #include "model_data.h"
 
@@ -22,11 +23,17 @@ constexpr size_t kTensorArenaSize = 1024 * 1024;
 constexpr float kDetectionThreshold = 0.60f;
 constexpr uint32_t kDetectionIntervalMs = 700;
 constexpr uint32_t kDetectionTimeoutMs = 6000;
+constexpr uint32_t kPreviewIdleTimeoutMs = 20000;
+constexpr uint8_t kSnapshotJpegQuality = 80;
 
 constexpr uint8_t kPacketTypeScaleCommand = 1;
 constexpr uint8_t kPacketTypeDetectionResult = 2;
 
 uint8_t kBroadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+IPAddress kStaticIp(192, 168, 1, 34);
+IPAddress kGatewayIp(192, 168, 1, 1);
+IPAddress kSubnetMask(255, 255, 255, 0);
+IPAddress kDnsIp(8, 8, 8, 8);
 
 struct ScaleCommandPacket {
   uint8_t packetType;
@@ -181,12 +188,14 @@ uint32_t sequence_id = 0;
 uint32_t command_sequence_id = 0;
 uint32_t last_detection_ms = 0;
 uint32_t detection_started_ms = 0;
+uint32_t last_preview_ms = 0;
 WebServer web_server(80);
 char latest_label[32] = "Idle";
 float latest_confidence = 0.0f;
 uint32_t latest_uptime_ms = 0;
 bool detection_active = false;
 bool detection_result_sent = false;
+bool preview_active = false;
 bool esp_now_ready = false;
 bool camera_ready = false;
 bool model_ready = false;
@@ -234,13 +243,21 @@ const char* normalizeFruitName(const char* label) {
   return label;
 }
 
+bool cameraOutputActive() {
+  return detection_active || preview_active;
+}
+
+void updateCameraOutput() {
+  digitalWrite(kLedPin, cameraOutputActive() ? HIGH : LOW);
+}
+
 void setDetectionActive(bool active, const char* reason) {
   if (detection_active == active) {
     return;
   }
 
   detection_active = active;
-  digitalWrite(kLedPin, active ? HIGH : LOW);
+  updateCameraOutput();
   if (active) {
     detection_started_ms = millis();
     last_detection_ms = 0;
@@ -257,6 +274,31 @@ void setDetectionActive(bool active, const char* reason) {
   }
 
   Serial.print(active ? "Detection ON: " : "Detection OFF: ");
+  Serial.println(reason);
+}
+
+void setPreviewActive(bool active, const char* reason) {
+  if (active) {
+    last_preview_ms = millis();
+  }
+
+  if (preview_active == active) {
+    return;
+  }
+
+  preview_active = active;
+  updateCameraOutput();
+  if (active && !detection_active && strcmp(latest_label, "Idle") == 0) {
+    strlcpy(latest_label, "Preview", sizeof(latest_label));
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+  } else if (!cameraOutputActive() && !detection_result_sent) {
+    strlcpy(latest_label, "Idle", sizeof(latest_label));
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+  }
+
+  Serial.print(active ? "Preview ON: " : "Preview OFF: ");
   Serial.println(reason);
 }
 
@@ -322,6 +364,9 @@ bool addBroadcastPeer() {
 
 bool connectWifi() {
   WiFi.mode(WIFI_STA);
+  if (!WiFi.config(kStaticIp, kGatewayIp, kSubnetMask, kDnsIp)) {
+    Serial.println("Static IP config failed; DHCP will be used");
+  }
   WiFi.begin(kWifiSsid, kWifiPassword);
 
   Serial.print("Connecting WiFi");
@@ -367,51 +412,108 @@ bool initEspNow() {
   return true;
 }
 
+void handleSnapshotRequest() {
+  if (!camera_ready) {
+    web_server.send(503, "text/plain", "Camera is not ready");
+    return;
+  }
+  if (!cameraOutputActive()) {
+    web_server.send(409, "text/plain", "Camera is idle");
+    return;
+  }
+
+  last_preview_ms = millis();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb == nullptr) {
+    web_server.send(503, "text/plain", "Camera capture failed");
+    return;
+  }
+
+  uint8_t* jpg_buffer = nullptr;
+  size_t jpg_length = 0;
+  const bool converted = frame2jpg(
+    fb,
+    kSnapshotJpegQuality,
+    &jpg_buffer,
+    &jpg_length
+  );
+  esp_camera_fb_return(fb);
+
+  if (!converted || jpg_buffer == nullptr || jpg_length == 0) {
+    if (jpg_buffer != nullptr) {
+      free(jpg_buffer);
+    }
+    web_server.send(500, "text/plain", "JPEG conversion failed");
+    return;
+  }
+
+  web_server.sendHeader("Cache-Control", "no-store");
+  web_server.setContentLength(jpg_length);
+  web_server.send(200, "image/jpeg", "");
+  web_server.client().write(jpg_buffer, jpg_length);
+  free(jpg_buffer);
+}
+
 void startWebServer() {
   web_server.on("/", []() {
-    const char* html =
-      "<!DOCTYPE html>"
-      "<html>"
-      "<head>"
-      "<title>FruitCam Live</title>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<style>"
-      "body{font-family:Arial,sans-serif;background:#101820;color:white;margin:0;padding:18px;text-align:center;}"
-      "main{max-width:520px;margin:0 auto;}"
-      "h2{margin:10px 0 18px;}"
-      ".fruit{font-size:42px;font-weight:700;margin:18px 0;word-break:break-word;}"
-      ".confidence{font-size:22px;color:#8ee59b;margin-bottom:12px;}"
-      ".meta{color:#b8c1cc;font-size:15px;}"
-      "button{font-size:18px;padding:12px 20px;margin:8px;border:0;border-radius:8px;}"
-      ".on{background:#2e7d32;color:white;}.off{background:#b71c1c;color:white;}"
-      ".panel{background:#1d2a35;border-radius:10px;padding:18px;}"
-      "</style>"
-      "</head>"
-      "<body>"
-      "<main>"
-      "<h2>FruitCam Live</h2>"
-      "<div class='panel'>"
-      "<div class='fruit' id='label'>None</div>"
-      "<div class='confidence' id='confidence'>0%</div>"
-      "<div class='meta' id='meta'>Waiting for detection...</div>"
-      "<button class='on' onclick=\"fetch('/detect/start')\">START TEST</button>"
-      "<button class='off' onclick=\"fetch('/detect/stop')\">STOP</button>"
-      "</div>"
-      "</main>"
-      "<script>"
-      "async function refresh(){"
-      "try{"
-      "const r=await fetch('/status?ts='+Date.now());"
-      "const s=await r.json();"
-      "document.getElementById('label').textContent=s.label;"
-      "document.getElementById('confidence').textContent=Math.round(s.confidence*100)+'% confidence';"
-      "document.getElementById('meta').textContent=(s.active?'Detecting':'Idle')+' | LED '+(s.led?'ON':'OFF')+' | Sequence '+s.sequence+' | uptime '+Math.round(s.uptime_ms/1000)+'s';"
-      "}catch(e){document.getElementById('meta').textContent='Connection lost';}"
-      "}"
-      "setInterval(refresh,1000);refresh();"
-      "</script>"
-      "</body>"
-      "</html>";
+    const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>FruitCam Live</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Arial,sans-serif;background:#101820;color:white;margin:0;padding:18px;text-align:center;}
+    main{max-width:560px;margin:0 auto;}
+    h2{margin:10px 0 14px;}
+    img{display:none;width:100%;max-width:520px;background:#000;border:1px solid #3f5566;border-radius:8px;}
+    button{font-size:18px;padding:12px 18px;margin:6px;border:0;border-radius:8px;color:white;}
+    .on{background:#2e7d32;}.off{background:#b71c1c;}.test{background:#1565c0;}
+    .panel{background:#1d2a35;border-radius:10px;padding:16px;}
+    .fruit{font-size:34px;font-weight:700;margin:12px 0;word-break:break-word;}
+    .confidence{font-size:18px;color:#8ee59b;margin-bottom:8px;}
+    .meta,.idle{color:#b8c1cc;font-size:14px;line-height:1.4;}
+  </style>
+</head>
+<body>
+  <main>
+    <h2>FruitCam Live</h2>
+    <div class="panel">
+      <img id="preview" src="/snapshot.jpg">
+      <p class="idle" id="idle">Camera idle</p>
+      <div class="fruit" id="label">Idle</div>
+      <div class="confidence" id="confidence">0% confidence</div>
+      <div class="meta" id="meta">Waiting for scale detection...</div>
+      <button class="on" onclick="fetch('/preview/start')">Preview ON</button>
+      <button class="off" onclick="fetch('/preview/stop')">Preview OFF</button>
+      <button class="test" onclick="fetch('/detect/start')">Detect Test</button>
+      <button class="off" onclick="fetch('/detect/stop')">Stop</button>
+    </div>
+  </main>
+  <script>
+    async function refresh(){
+      try{
+        const r=await fetch('/status?ts='+Date.now());
+        const s=await r.json();
+        const img=document.getElementById('preview');
+        const idle=document.getElementById('idle');
+        const cameraOn=s.cameraOn;
+        document.getElementById('label').textContent=s.label;
+        document.getElementById('confidence').textContent=Math.round(s.confidence*100)+'% confidence';
+        document.getElementById('meta').textContent=(s.active?'Detecting':'Idle')+' | Preview '+(s.preview?'ON':'OFF')+' | LED '+(s.led?'ON':'OFF')+' | IP '+s.ip;
+        img.style.display=cameraOn?'block':'none';
+        idle.style.display=cameraOn?'none':'block';
+        if(cameraOn){img.src='/snapshot.jpg?ts='+Date.now();}
+      }catch(e){
+        document.getElementById('meta').textContent='Connection lost';
+      }
+    }
+    setInterval(refresh,900);
+    refresh();
+  </script>
+</body>
+</html>
+)rawliteral";
 
     web_server.send(200, "text/html", html);
   });
@@ -428,10 +530,31 @@ void startWebServer() {
     json += String(latest_uptime_ms);
     json += ",\"active\":";
     json += detection_active ? "true" : "false";
+    json += ",\"preview\":";
+    json += preview_active ? "true" : "false";
+    json += ",\"cameraOn\":";
+    json += cameraOutputActive() ? "true" : "false";
     json += ",\"led\":";
     json += digitalRead(kLedPin) == HIGH ? "true" : "false";
+    json += ",\"ip\":\"";
+    json += WiFi.localIP().toString();
+    json += "\"";
     json += "}";
     web_server.send(200, "application/json", json);
+  });
+
+  web_server.on("/snapshot.jpg", []() {
+    handleSnapshotRequest();
+  });
+
+  web_server.on("/preview/start", []() {
+    setPreviewActive(true, "web/app preview");
+    web_server.send(200, "text/plain", "Preview started");
+  });
+
+  web_server.on("/preview/stop", []() {
+    setPreviewActive(false, "web/app preview");
+    web_server.send(200, "text/plain", "Preview stopped");
   });
 
   web_server.on("/detect/start", []() {
@@ -450,7 +573,7 @@ void startWebServer() {
   });
 
   web_server.on("/led/off", []() {
-    if (!detection_active) {
+    if (!cameraOutputActive()) {
       digitalWrite(kLedPin, LOW);
     }
     web_server.send(200, "text/plain", digitalRead(kLedPin) == HIGH ? "LED is ON" : "LED is OFF");
@@ -703,6 +826,10 @@ void setup() {
 
 void loop() {
   web_server.handleClient();
+
+  if (preview_active && millis() - last_preview_ms >= kPreviewIdleTimeoutMs) {
+    setPreviewActive(false, "preview idle timeout");
+  }
 
   if (!detection_active) {
     delay(10);
