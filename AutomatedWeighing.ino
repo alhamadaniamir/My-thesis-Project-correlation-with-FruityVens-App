@@ -4,7 +4,8 @@
 #include <HX711_ADC.h>
 #include <EEPROM.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <RTClib.h>
 #include "time.h"
 #include <math.h>
@@ -20,8 +21,12 @@
 #define BTN_CANCEL 14
 #define BUZZER_PIN 26
 
-const char* ssid = "Aida_iPhone";
-const char* password = "1234567899";
+const char* ssid = "Parafiber_F0C0 2.4G";
+const char* password = "C0E277DF";
+
+const char* firebaseDatabaseUrl = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
+const char* firebaseScaleDeviceId = "fruityvens-scale-01";
+const char* firebaseAuthToken = "";
 
 const char* ntpServer = "time.google.com";
 const long gmtOffset_sec = 8 * 3600;
@@ -40,6 +45,7 @@ const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
+const unsigned long WIFI_RESULT_DISPLAY_MS = 2000;
 const unsigned long TARE_TIMEOUT_MS = 5000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
@@ -63,12 +69,13 @@ struct SaleRecord {
   char date[11];
   char time[9];
   char source[16];
+  char firebaseKey[80];
+  unsigned long createdAtMs;
 };
 
 hd44780_I2Cexp lcd(0x27);
 HX711_ADC LoadCell(HX_DOUT, HX_SCK);
 RTC_DS3231 rtc;
-WebServer server(80);
 
 struct ButtonState {
   uint8_t pin;
@@ -105,10 +112,14 @@ unsigned long latestSaleId = 0;
 size_t saleHistoryCount = 0;
 SaleRecord saleHistory[SALE_HISTORY_SIZE];
 char currentFruitType[32] = "Unknown";
+unsigned long lastFirebaseRetryMs = 0;
 
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
 String saleRecordJson(const SaleRecord& sale, const String& indent);
+String firebaseSafeKey(const char* value);
+String firebaseSafeKey(const String& value);
+bool uploadPendingSales();
 
 float calculatePrice(float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
@@ -119,17 +130,6 @@ const char* scaleStatusText() {
   if (weightLocked) return "locked";
   if (objectPresent) return "weighing";
   return "zero";
-}
-
-void sendCorsHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-void sendJson(int statusCode, const String& body) {
-  sendCorsHeaders();
-  server.send(statusCode, "application/json", body);
 }
 
 String jsonEscape(const char* value) {
@@ -150,20 +150,6 @@ String jsonEscape(const char* value) {
     }
   }
   return escaped;
-}
-
-String errorJson(const char* message) {
-  String body = "{\n";
-  body += "  \"error\": \"";
-  body += jsonEscape(message);
-  body += "\"\n";
-  body += "}";
-  return body;
-}
-
-void handleOptions() {
-  sendCorsHeaders();
-  server.send(204);
 }
 
 bool isValidCalibrationFactor(float value) {
@@ -260,6 +246,7 @@ void printScaleHelp() {
   Serial.println("  - or z = decrease calibration factor");
   Serial.println("  r = reset calibration factor");
   Serial.println("  c 500 = calibrate with known 500g weight");
+  Serial.println("  fruit Mango = set fruit name sent with Firebase sale");
   Serial.println("Buttons: released=1, pressed=0");
 }
 
@@ -349,6 +336,12 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   char line2[21];
   snprintf(line2, sizeof(line2), "PHP %.2f", sale.price);
   showMessage("Sale confirmed", line2);
+  const bool uploaded = uploadPendingSales();
+  if (uploaded) {
+    showMessage("Firebase synced", line2);
+  } else {
+    showMessage("Saved for sync", line2);
+  }
   beepBuzzer(1);
   return sale;
 }
@@ -481,6 +474,8 @@ void setupRtc() {
 void setupWifi() {
   lcd.clear();
   lcd.print("Connecting WiFi...");
+  lcd.setCursor(0, 1);
+  lcd.print(ssid);
 
   WiFi.begin(ssid, password);
 
@@ -488,14 +483,29 @@ void setupWifi() {
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(500);
     Serial.print(".");
+    lcd.setCursor(tries % LCD_COLS, 2);
+    lcd.print(".");
     tries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi OK");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    lcd.clear();
+    lcd.print("WiFi connected");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
   } else {
     Serial.println("WiFi FAILED");
+    lcd.clear();
+    lcd.print("WiFi failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Check SSID/pass");
+    lcd.setCursor(0, 2);
+    lcd.print("Offline sync queue");
   }
+  delay(WIFI_RESULT_DISPLAY_MS);
 }
 
 void syncRtcFromNtp() {
@@ -585,8 +595,16 @@ String saleRecordJson(const SaleRecord& sale, const String& indent) {
   body += String(sale.price, 2);
   body += ",\n";
   body += indent;
+  body += "\"priceCentavos\": ";
+  body += String((int)round(sale.price * 100.0));
+  body += ",\n";
+  body += indent;
   body += "\"pricePerKg\": ";
   body += String(pricePerKg, 2);
+  body += ",\n";
+  body += indent;
+  body += "\"pricePerKgCentavos\": ";
+  body += String((int)round(pricePerKg * 100.0));
   body += ",\n";
   body += indent;
   body += "\"fruitType\": \"";
@@ -605,6 +623,10 @@ String saleRecordJson(const SaleRecord& sale, const String& indent) {
   body += jsonEscape(sale.timestamp);
   body += "\",\n";
   body += indent;
+  body += "\"soldAt\": \"";
+  body += jsonEscape(sale.timestamp);
+  body += "\",\n";
+  body += indent;
   body += "\"date\": \"";
   body += jsonEscape(sale.date);
   body += "\",\n";
@@ -615,7 +637,19 @@ String saleRecordJson(const SaleRecord& sale, const String& indent) {
   body += indent;
   body += "\"source\": \"";
   body += jsonEscape(sale.source);
-  body += "\"\n";
+  body += "\",\n";
+  body += indent;
+  body += "\"sourceDeviceId\": \"";
+  body += jsonEscape(firebaseScaleDeviceId);
+  body += "\",\n";
+  body += indent;
+  body += "\"status\": \"sold\",\n";
+  body += indent;
+  body += "\"imported\": false,\n";
+  body += indent;
+  body += "\"createdAtMs\": ";
+  body += String(sale.createdAtMs);
+  body += "\n";
   body += "}";
   return body;
 }
@@ -625,11 +659,15 @@ SaleRecord recordSale(const char* source) {
   sale.id = nextSaleId++;
   sale.weightGrams = currentWeightGrams;
   sale.price = calculatePrice(currentWeightGrams);
+  sale.createdAtMs = millis();
   strlcpy(sale.fruitType, currentFruitType, sizeof(sale.fruitType));
   strlcpy(sale.source, source, sizeof(sale.source));
   copyCurrentDateTime(sale.timestamp, sizeof(sale.timestamp),
                       sale.date, sizeof(sale.date),
                       sale.time, sizeof(sale.time));
+  const String firebaseKey =
+    firebaseSafeKey(String(sale.id) + "_" + sale.timestamp + "_" + String(sale.createdAtMs));
+  firebaseKey.toCharArray(sale.firebaseKey, sizeof(sale.firebaseKey));
 
   latestSaleId = sale.id;
   if (saleHistoryCount >= SALE_HISTORY_SIZE) {
@@ -642,193 +680,6 @@ SaleRecord recordSale(const char* source) {
   saleHistoryCount++;
 
   return sale;
-}
-
-void handleStatusRequest() {
-  String body = "{\n";
-  body += "  \"ready\": ";
-  body += hx711Ready ? "true" : "false";
-  body += ",\n  \"weightGrams\": ";
-  body += String(currentWeightGrams, 2);
-  body += ",\n  \"price\": ";
-  body += String(calculatePrice(currentWeightGrams), 2);
-  body += ",\n  \"pricePerKg\": ";
-  body += String(pricePerKg, 2);
-  body += ",\n  \"status\": \"";
-  body += scaleStatusText();
-  body += "\",\n  \"fruitType\": \"";
-  body += jsonEscape(currentFruitType);
-  body += "\",\n  \"latestSaleId\": ";
-  body += String(latestSaleId);
-  body += ",\n  \"pendingSales\": ";
-  body += String(saleHistoryCount);
-  body += ",\n  \"rtcReady\": ";
-  body += rtcReady ? "true" : "false";
-  body += ",\n  \"timestamp\": \"";
-  body += currentTimestamp();
-  body += "\",\n  \"date\": \"";
-  char date[11];
-  char time[9];
-  char timestamp[25];
-  copyCurrentDateTime(timestamp, sizeof(timestamp), date, sizeof(date), time, sizeof(time));
-  body += jsonEscape(date);
-  body += "\",\n  \"time\": \"";
-  body += jsonEscape(time);
-  body += "\",\n  \"ip\": \"";
-  body += WiFi.localIP().toString();
-  body += "\"\n";
-  body += "}";
-
-  sendJson(200, body);
-}
-
-void handleTareRequest() {
-  tareScale("App tare");
-  handleStatusRequest();
-}
-
-void handleConfirmRequest() {
-  SaleRecord sale = confirmSale("APP SALE OK", "app");
-  sendJson(200, saleRecordJson(sale));
-}
-
-void handleLatestSaleRequest() {
-  if (saleHistoryCount == 0) {
-    sendJson(404, errorJson("No pending confirmed sale yet"));
-    return;
-  }
-
-  sendJson(200, saleRecordJson(saleHistory[saleHistoryCount - 1]));
-}
-
-void handleSalesRequest() {
-  String body = "[";
-  bool first = true;
-  for (size_t i = 0; i < saleHistoryCount; i++) {
-    if (saleHistory[i].id == 0) continue;
-    if (first) {
-      body += "\n";
-    } else {
-      body += ",\n";
-    }
-    body += "  ";
-    body += saleRecordJson(saleHistory[i], "    ");
-    first = false;
-  }
-  if (!first) {
-    body += "\n";
-  }
-  body += "]";
-  sendJson(200, body);
-}
-
-bool requestAcknowledgesSale(const String& body, unsigned long saleId) {
-  unsigned long value = 0;
-  bool readingNumber = false;
-
-  for (unsigned int i = 0; i < body.length(); i++) {
-    const char c = body.charAt(i);
-    if (c >= '0' && c <= '9') {
-      readingNumber = true;
-      value = (value * 10) + (c - '0');
-      continue;
-    }
-
-    if (readingNumber) {
-      if (value == saleId) {
-        return true;
-      }
-      value = 0;
-      readingNumber = false;
-    }
-  }
-
-  return readingNumber && value == saleId;
-}
-
-size_t acknowledgeSales(const String& body) {
-  size_t acknowledged = 0;
-  size_t kept = 0;
-
-  for (size_t i = 0; i < saleHistoryCount; i++) {
-    if (requestAcknowledgesSale(body, saleHistory[i].id)) {
-      acknowledged++;
-      continue;
-    }
-    if (kept != i) {
-      saleHistory[kept] = saleHistory[i];
-    }
-    kept++;
-  }
-
-  for (size_t i = kept; i < saleHistoryCount; i++) {
-    saleHistory[i] = SaleRecord{};
-  }
-  saleHistoryCount = kept;
-  return acknowledged;
-}
-
-void handleSalesAckRequest() {
-  String body = server.hasArg("plain") ? server.arg("plain") : "";
-  body.trim();
-  if (body.length() == 0) {
-    sendJson(400, errorJson("Missing acknowledged sale IDs"));
-    return;
-  }
-
-  const size_t acknowledged = acknowledgeSales(body);
-  String response = "{\n";
-  response += "  \"acknowledged\": ";
-  response += String(acknowledged);
-  response += ",\n  \"pendingSales\": ";
-  response += String(saleHistoryCount);
-  response += "\n}";
-  sendJson(200, response);
-}
-
-void handleFruitRequest() {
-  String fruit = server.arg("type");
-  if (fruit.length() == 0 && server.hasArg("plain")) {
-    fruit = server.arg("plain");
-  }
-  fruit.trim();
-
-  if (fruit.length() == 0) {
-    sendJson(400, errorJson("Missing fruit type"));
-    return;
-  }
-
-  fruit.toCharArray(currentFruitType, sizeof(currentFruitType));
-  handleStatusRequest();
-}
-
-void handleCancelRequest() {
-  cancelSale("App cancel tare");
-  handleStatusRequest();
-}
-
-void setupApiServer() {
-  server.on("/", HTTP_GET, handleStatusRequest);
-  server.on("/status", HTTP_GET, handleStatusRequest);
-  server.on("/tare", HTTP_POST, handleTareRequest);
-  server.on("/confirm", HTTP_POST, handleConfirmRequest);
-  server.on("/cancel", HTTP_POST, handleCancelRequest);
-  server.on("/fruit", HTTP_POST, handleFruitRequest);
-  server.on("/sale/latest", HTTP_GET, handleLatestSaleRequest);
-  server.on("/sales", HTTP_GET, handleSalesRequest);
-  server.on("/sales/ack", HTTP_POST, handleSalesAckRequest);
-  server.onNotFound([]() {
-    if (server.method() == HTTP_OPTIONS) {
-      handleOptions();
-      return;
-    }
-    sendJson(404, errorJson("Not found"));
-  });
-  server.begin();
-
-  Serial.print("Scale API: http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/status");
 }
 
 void updateDisplay() {
@@ -861,6 +712,133 @@ void updateDisplay() {
     snprintf(line, sizeof(line), "RTC not detected");
   }
   printPadded(0, 3, line);
+}
+
+String firebaseSafeKey(const char* value) {
+  String key = "";
+  for (size_t i = 0; value[i] != '\0'; i++) {
+    const char c = value[i];
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_') {
+      key += c;
+    } else {
+      key += '_';
+    }
+  }
+  return key.length() == 0 ? "unknown" : key;
+}
+
+String firebaseSafeKey(const String& value) {
+  char buffer[96];
+  value.toCharArray(buffer, sizeof(buffer));
+  return firebaseSafeKey(buffer);
+}
+
+String firebaseSaleKey(const SaleRecord& sale) {
+  if (strlen(sale.firebaseKey) > 0) {
+    return firebaseSafeKey(sale.firebaseKey);
+  }
+  String key = String(sale.id);
+  key += "_";
+  key += sale.timestamp;
+  key += "_";
+  key += String(sale.createdAtMs);
+  return firebaseSafeKey(key);
+}
+
+String firebaseRequestUrl(const SaleRecord& sale) {
+  String base = firebaseDatabaseUrl;
+  while (base.endsWith("/")) {
+    base.remove(base.length() - 1);
+  }
+
+  String url = base;
+  url += "/scaleSales/";
+  url += firebaseSafeKey(firebaseScaleDeviceId);
+  url += "/";
+  url += firebaseSaleKey(sale);
+  url += ".json";
+  if (strlen(firebaseAuthToken) > 0) {
+    url += "?auth=";
+    url += firebaseAuthToken;
+  }
+  return url;
+}
+
+bool uploadSaleToFirebase(const SaleRecord& sale) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Firebase upload skipped: WiFi disconnected");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  const String url = firebaseRequestUrl(sale);
+  if (!http.begin(client, url)) {
+    Serial.println("Firebase upload failed: could not start HTTPS request");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  const int statusCode = http.PUT(saleRecordJson(sale));
+  const String response = http.getString();
+  http.end();
+
+  Serial.print("Firebase upload HTTP ");
+  Serial.print(statusCode);
+  Serial.print(": ");
+  Serial.println(response);
+
+  return statusCode >= 200 && statusCode < 300;
+}
+
+bool uploadPendingSales() {
+  if (saleHistoryCount == 0) {
+    return true;
+  }
+
+  size_t kept = 0;
+  size_t uploaded = 0;
+  for (size_t i = 0; i < saleHistoryCount; i++) {
+    if (saleHistory[i].id != 0 && uploadSaleToFirebase(saleHistory[i])) {
+      uploaded++;
+      continue;
+    }
+    if (kept != i) {
+      saleHistory[kept] = saleHistory[i];
+    }
+    kept++;
+  }
+
+  for (size_t i = kept; i < saleHistoryCount; i++) {
+    saleHistory[i] = SaleRecord{};
+  }
+  saleHistoryCount = kept;
+
+  Serial.print("Firebase pending sales uploaded: ");
+  Serial.print(uploaded);
+  Serial.print(", remaining: ");
+  Serial.println(saleHistoryCount);
+
+  return saleHistoryCount == 0;
+}
+
+void setCurrentFruitType(const String& fruit) {
+  String cleanFruit = fruit;
+  cleanFruit.trim();
+  if (cleanFruit.length() == 0) {
+    Serial.println("Fruit name is empty.");
+    return;
+  }
+
+  cleanFruit.toCharArray(currentFruitType, sizeof(currentFruitType));
+  Serial.print("Current fruit set to: ");
+  Serial.println(currentFruitType);
+  showMessage("Fruit selected", currentFruitType);
 }
 
 void handleButtons() {
@@ -919,6 +897,17 @@ void processSerialCommand() {
     return;
   }
 
+  if (command.startsWith("fruit ") || command.startsWith("Fruit ") ||
+      command.startsWith("FRUIT ")) {
+    setCurrentFruitType(command.substring(6));
+    return;
+  }
+
+  if (command.startsWith("f ") || command.startsWith("F ")) {
+    setCurrentFruitType(command.substring(2));
+    return;
+  }
+
   printScaleHelp();
 }
 
@@ -950,7 +939,6 @@ void setup() {
   setupWifi();
   syncRtcFromNtp();
   setupScale();
-  setupApiServer();
 
   showMessage(hx711Ready ? "Ready!" : "Scale not ready");
 }
@@ -967,7 +955,13 @@ void loop() {
 
   handleButtons();
   processSerialCommand();
-  server.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED &&
+      saleHistoryCount > 0 &&
+      millis() - lastFirebaseRetryMs >= 5000) {
+    lastFirebaseRetryMs = millis();
+    uploadPendingSales();
+  }
 
   if (millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
     if (objectPresent || weightLocked) {
