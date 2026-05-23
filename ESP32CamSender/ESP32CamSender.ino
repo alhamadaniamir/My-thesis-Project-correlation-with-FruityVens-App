@@ -14,17 +14,29 @@
 namespace {
 
 constexpr char kDeviceName[] = "ESP32-CAM";
-constexpr char kWebSsid[] = "FruitCam";
-constexpr char kWebPassword[] = "12345678";
+constexpr char kWifiSsid[] = "Parafiber_F0C0 2.4G";
+constexpr char kWifiPassword[] = "C0E277DF";
+constexpr int kLedPin = 13;
 constexpr int kInputSize = 96;
 constexpr size_t kTensorArenaSize = 1024 * 1024;
-constexpr uint8_t kEspNowChannel = 1;
-constexpr uint32_t kSendIntervalMs = 2000;
+constexpr float kDetectionThreshold = 0.60f;
+constexpr uint32_t kDetectionIntervalMs = 700;
+constexpr uint32_t kDetectionTimeoutMs = 6000;
 
-// Replace with the MAC address of the receiver ESP32.
-  uint8_t kReceiverMac[] = {0xD4, 0xE9, 0xF4, 0xB1, 0x0D, 0x98};
+constexpr uint8_t kPacketTypeScaleCommand = 1;
+constexpr uint8_t kPacketTypeDetectionResult = 2;
+
+uint8_t kBroadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+struct ScaleCommandPacket {
+  uint8_t packetType;
+  char command[16];
+  uint32_t sequence;
+  uint32_t uptime_ms;
+};
 
 struct DetectionPacket {
+  uint8_t packetType;
   char label[32];
   float confidence;
   uint32_t sequence;
@@ -166,11 +178,18 @@ TfLiteTensor* input_tensor = nullptr;
 TfLiteTensor* output_tensor = nullptr;
 uint8_t* tensor_arena = nullptr;
 uint32_t sequence_id = 0;
-uint32_t last_send_ms = 0;
+uint32_t command_sequence_id = 0;
+uint32_t last_detection_ms = 0;
+uint32_t detection_started_ms = 0;
 WebServer web_server(80);
-char latest_label[32] = "None";
+char latest_label[32] = "Idle";
 float latest_confidence = 0.0f;
 uint32_t latest_uptime_ms = 0;
+bool detection_active = false;
+bool detection_result_sent = false;
+bool esp_now_ready = false;
+bool camera_ready = false;
+bool model_ready = false;
 
 String macToString(const uint8_t* mac) {
   char buffer[18];
@@ -192,6 +211,55 @@ const char* mapLabel(const char* raw_label) {
   return raw_label;
 }
 
+bool labelStartsWith(const char* label, const char* prefix) {
+  return strncmp(label, prefix, strlen(prefix)) == 0;
+}
+
+const char* normalizeFruitName(const char* label) {
+  if (labelStartsWith(label, "Apple")) return "Apple";
+  if (labelStartsWith(label, "Avocado")) return "Avocado";
+  if (labelStartsWith(label, "Banana")) return "Banana";
+  if (labelStartsWith(label, "Grape")) return "Grapes";
+  if (labelStartsWith(label, "Guava")) return "Guava";
+  if (labelStartsWith(label, "Lemon") || labelStartsWith(label, "Limes")) return "Lemon";
+  if (labelStartsWith(label, "Mango")) return "Mango";
+  if (labelStartsWith(label, "Orange") || labelStartsWith(label, "Mandarine")) return "Orange";
+  if (labelStartsWith(label, "Papaya")) return "Papaya";
+  if (labelStartsWith(label, "Pear")) return "Pear";
+  if (labelStartsWith(label, "Pineapple")) return "Pineapple";
+  if (labelStartsWith(label, "Pomelo")) return "Pomelo";
+  if (labelStartsWith(label, "Rambutan")) return "Rambutan";
+  if (labelStartsWith(label, "Strawberry")) return "Strawberries";
+  if (labelStartsWith(label, "Watermelon")) return "Watermelon";
+  return label;
+}
+
+void setDetectionActive(bool active, const char* reason) {
+  if (detection_active == active) {
+    return;
+  }
+
+  detection_active = active;
+  digitalWrite(kLedPin, active ? HIGH : LOW);
+  if (active) {
+    detection_started_ms = millis();
+    last_detection_ms = 0;
+    detection_result_sent = false;
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+    strlcpy(latest_label, "Processing", sizeof(latest_label));
+  } else {
+    if (!detection_result_sent) {
+      strlcpy(latest_label, "Idle", sizeof(latest_label));
+      latest_confidence = 0.0f;
+      latest_uptime_ms = millis();
+    }
+  }
+
+  Serial.print(active ? "Detection ON: " : "Detection OFF: ");
+  Serial.println(reason);
+}
+
 void onSendComplete(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
   Serial.print("ESP-NOW send to ");
   if (tx_info != nullptr && tx_info->des_addr != nullptr) {
@@ -203,46 +271,99 @@ void onSendComplete(const esp_now_send_info_t* tx_info, esp_now_send_status_t st
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
+void onPacketReceived(const esp_now_recv_info_t* recv_info, const uint8_t* data, int len) {
+  if (len != sizeof(ScaleCommandPacket)) {
+    return;
+  }
+
+  ScaleCommandPacket packet = {};
+  memcpy(&packet, data, sizeof(packet));
+  packet.command[sizeof(packet.command) - 1] = '\0';
+  if (packet.packetType != kPacketTypeScaleCommand) {
+    return;
+  }
+
+  command_sequence_id = packet.sequence;
+  Serial.print("Scale command ");
+  Serial.print(packet.command);
+  Serial.print(" from ");
+  Serial.println(macToString(recv_info->src_addr));
+
+  if (strcmp(packet.command, "START") == 0) {
+    setDetectionActive(true, "scale weight detected");
+  } else if (strcmp(packet.command, "STOP") == 0) {
+    setDetectionActive(false, "scale stopped");
+  }
+}
+
+bool addBroadcastPeer() {
+  if (esp_now_is_peer_exist(kBroadcastPeer)) {
+    return true;
+  }
+
+  uint8_t channel = WiFi.channel();
+  if (channel == 0) {
+    channel = 1;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  }
+
+  esp_now_peer_info_t peer_info = {};
+  memcpy(peer_info.peer_addr, kBroadcastPeer, 6);
+  peer_info.channel = channel;
+  peer_info.encrypt = false;
+
+  if (esp_now_add_peer(&peer_info) != ESP_OK) {
+    Serial.println("esp_now_add_peer(broadcast) failed");
+    return false;
+  }
+
+  return true;
+}
+
+bool connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(kWifiSsid, kWifiPassword);
+
+  Serial.print("Connecting WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi FAILED");
+    WiFi.disconnect(false, false);
+    return false;
+  }
+
+  Serial.print("WiFi OK. IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("WiFi channel: ");
+  Serial.println(WiFi.channel());
+  return true;
+}
+
 bool initEspNow() {
-  WiFi.mode(WIFI_AP_STA);
-
-  if (esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
-    Serial.println("Failed to set WiFi channel");
-    return false;
-  }
-
-  if (!WiFi.softAP(kWebSsid, kWebPassword, kEspNowChannel)) {
-    Serial.println("WiFi access point failed");
-    return false;
-  }
-
   if (esp_now_init() != ESP_OK) {
     Serial.println("esp_now_init() failed");
     return false;
   }
 
   esp_now_register_send_cb(onSendComplete);
+  esp_now_register_recv_cb(onPacketReceived);
 
-  esp_now_peer_info_t peer_info = {};
-  memcpy(peer_info.peer_addr, kReceiverMac, 6);
-  peer_info.channel = kEspNowChannel;
-  peer_info.encrypt = false;
-
-  if (esp_now_add_peer(&peer_info) != ESP_OK) {
-    Serial.println("esp_now_add_peer() failed");
+  if (!addBroadcastPeer()) {
     return false;
   }
 
   Serial.print("Sender MAC: ");
   Serial.println(WiFi.macAddress());
-  Serial.print("Web WiFi: ");
-  Serial.println(kWebSsid);
   Serial.print("Web address: http://");
-  Serial.println(WiFi.softAPIP());
-  Serial.print("Receiver MAC: ");
-  Serial.println(macToString(kReceiverMac));
-  Serial.print("ESP-NOW channel: ");
-  Serial.println(kEspNowChannel);
+  Serial.println(WiFi.localIP());
+  Serial.println("ESP-NOW ready for scale START/STOP commands");
   return true;
 }
 
@@ -261,6 +382,8 @@ void startWebServer() {
       ".fruit{font-size:42px;font-weight:700;margin:18px 0;word-break:break-word;}"
       ".confidence{font-size:22px;color:#8ee59b;margin-bottom:12px;}"
       ".meta{color:#b8c1cc;font-size:15px;}"
+      "button{font-size:18px;padding:12px 20px;margin:8px;border:0;border-radius:8px;}"
+      ".on{background:#2e7d32;color:white;}.off{background:#b71c1c;color:white;}"
       ".panel{background:#1d2a35;border-radius:10px;padding:18px;}"
       "</style>"
       "</head>"
@@ -271,6 +394,8 @@ void startWebServer() {
       "<div class='fruit' id='label'>None</div>"
       "<div class='confidence' id='confidence'>0%</div>"
       "<div class='meta' id='meta'>Waiting for detection...</div>"
+      "<button class='on' onclick=\"fetch('/detect/start')\">START TEST</button>"
+      "<button class='off' onclick=\"fetch('/detect/stop')\">STOP</button>"
       "</div>"
       "</main>"
       "<script>"
@@ -280,7 +405,7 @@ void startWebServer() {
       "const s=await r.json();"
       "document.getElementById('label').textContent=s.label;"
       "document.getElementById('confidence').textContent=Math.round(s.confidence*100)+'% confidence';"
-      "document.getElementById('meta').textContent='Sequence '+s.sequence+' | uptime '+Math.round(s.uptime_ms/1000)+'s';"
+      "document.getElementById('meta').textContent=(s.active?'Detecting':'Idle')+' | LED '+(s.led?'ON':'OFF')+' | Sequence '+s.sequence+' | uptime '+Math.round(s.uptime_ms/1000)+'s';"
       "}catch(e){document.getElementById('meta').textContent='Connection lost';}"
       "}"
       "setInterval(refresh,1000);refresh();"
@@ -301,8 +426,34 @@ void startWebServer() {
     json += String(sequence_id);
     json += ",\"uptime_ms\":";
     json += String(latest_uptime_ms);
+    json += ",\"active\":";
+    json += detection_active ? "true" : "false";
+    json += ",\"led\":";
+    json += digitalRead(kLedPin) == HIGH ? "true" : "false";
     json += "}";
     web_server.send(200, "application/json", json);
+  });
+
+  web_server.on("/detect/start", []() {
+    setDetectionActive(true, "web test");
+    web_server.send(200, "text/plain", "Detection started");
+  });
+
+  web_server.on("/detect/stop", []() {
+    setDetectionActive(false, "web test");
+    web_server.send(200, "text/plain", "Detection stopped");
+  });
+
+  web_server.on("/led/on", []() {
+    digitalWrite(kLedPin, HIGH);
+    web_server.send(200, "text/plain", "LED is ON");
+  });
+
+  web_server.on("/led/off", []() {
+    if (!detection_active) {
+      digitalWrite(kLedPin, LOW);
+    }
+    web_server.send(200, "text/plain", digitalRead(kLedPin) == HIGH ? "LED is ON" : "LED is OFF");
   });
 
   web_server.begin();
@@ -324,8 +475,8 @@ bool initCamera() {
   camera_config.pin_pclk = 22;
   camera_config.pin_vsync = 25;
   camera_config.pin_href = 23;
-  camera_config.pin_sscb_sda = 26;
-  camera_config.pin_sscb_scl = 27;
+  camera_config.pin_sccb_sda = 26;
+  camera_config.pin_sccb_scl = 27;
   camera_config.pin_pwdn = 32;
   camera_config.pin_reset = -1;
   camera_config.xclk_freq_hz = 20000000;
@@ -490,6 +641,7 @@ void findTopPrediction(int& best_index, float& best_probability) {
 
 void sendDetection(const char* label, float confidence) {
   DetectionPacket packet = {};
+  packet.packetType = kPacketTypeDetectionResult;
   strlcpy(packet.label, label, sizeof(packet.label));
   packet.confidence = confidence;
   packet.sequence = ++sequence_id;
@@ -500,10 +652,13 @@ void sendDetection(const char* label, float confidence) {
   Serial.print(" | confidence=");
   Serial.println(packet.confidence, 4);
 
-  esp_err_t result = esp_now_send(kReceiverMac, reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
+  esp_err_t result = esp_now_send(kBroadcastPeer, reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
   if (result != ESP_OK) {
     Serial.printf("esp_now_send() failed: %d\n", result);
   }
+
+  detection_result_sent = true;
+  setDetectionActive(false, "result sent");
 }
 
 }  // namespace
@@ -513,6 +668,13 @@ void setup() {
   delay(1500);
   Serial.println();
   Serial.println(kDeviceName);
+
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
+
+  if (!connectWifi()) {
+    Serial.println("Camera will keep running, but ESP-NOW may not share the scale channel.");
+  }
 
   if (!initEspNow()) {
     while (true) {
@@ -525,21 +687,45 @@ void setup() {
       delay(1000);
     }
   }
+  camera_ready = true;
 
   if (!initTflm()) {
     while (true) {
       delay(1000);
     }
   }
+  model_ready = true;
+  esp_now_ready = true;
 
   startWebServer();
+  setDetectionActive(false, "startup idle");
 }
 
 void loop() {
   web_server.handleClient();
 
-  if (millis() - last_send_ms < kSendIntervalMs) {
+  if (!detection_active) {
     delay(10);
+    return;
+  }
+
+  if (millis() - detection_started_ms >= kDetectionTimeoutMs) {
+    strlcpy(latest_label, "Unknown", sizeof(latest_label));
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+    sendDetection("Unknown", 0.0f);
+    return;
+  }
+
+  if (last_detection_ms != 0 &&
+      millis() - last_detection_ms < kDetectionIntervalMs) {
+    delay(10);
+    return;
+  }
+  last_detection_ms = millis();
+
+  if (!camera_ready || !model_ready || !esp_now_ready) {
+    sendDetection("Unknown", 0.0f);
     return;
   }
 
@@ -563,16 +749,21 @@ void loop() {
   float best_probability = 0.0f;
   findTopPrediction(best_index, best_probability);
 
-  const char* predicted_label = mapLabel(g_class_labels[best_index]);
+  const char* raw_label = mapLabel(g_class_labels[best_index]);
+  const char* predicted_label =
+    best_probability >= kDetectionThreshold ? normalizeFruitName(raw_label) : "Unknown";
   strlcpy(latest_label, predicted_label, sizeof(latest_label));
   latest_confidence = best_probability;
   latest_uptime_ms = millis();
 
   Serial.print("Detected: ");
   Serial.print(predicted_label);
+  Serial.print(" raw=");
+  Serial.print(raw_label);
   Serial.print(" | confidence=");
   Serial.println(best_probability, 4);
 
-  sendDetection(predicted_label, best_probability);
-  last_send_ms = millis();
+  if (best_probability >= kDetectionThreshold) {
+    sendDetection(predicted_label, best_probability);
+  }
 }

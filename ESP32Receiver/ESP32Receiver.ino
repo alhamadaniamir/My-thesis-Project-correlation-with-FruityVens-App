@@ -5,19 +5,30 @@
 namespace {
 
 constexpr char kDeviceName[] = "ESP32 Receiver";
-constexpr uint8_t kEspNowChannel = 1;
+constexpr char kWifiSsid[] = "Parafiber_F0C0 2.4G";
+constexpr char kWifiPassword[] = "C0E277DF";
 constexpr int kStatusLedPin = 2;
 constexpr float kDetectionThreshold = 0.60f;
 constexpr char kLowConfidencePrefix[] = "[LOW CONFIDENCE] ";
 constexpr uint32_t kNoPacketMessageIntervalMs = 3000;
+constexpr uint8_t kPacketTypeScaleCommand = 1;
+constexpr uint8_t kPacketTypeDetectionResult = 2;
 
 // Optional filter. Set to false to accept packets from any ESP32-CAM sender.
 constexpr bool kFilterSender = false;
 uint8_t kExpectedSenderMac[] = {0x24, 0x6F, 0x28, 0x00, 0x00, 0x02};
 
 struct DetectionPacket {
+  uint8_t packetType;
   char label[32];
   float confidence;
+  uint32_t sequence;
+  uint32_t uptime_ms;
+};
+
+struct ScaleCommandPacket {
+  uint8_t packetType;
+  char command[16];
   uint32_t sequence;
   uint32_t uptime_ms;
 };
@@ -45,7 +56,48 @@ bool macMatches(const uint8_t* lhs, const uint8_t* rhs) {
   return true;
 }
 
+bool connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(kWifiSsid, kWifiPassword);
+
+  Serial.print("Connecting WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi failed; receiver will listen on fallback channel 1");
+    WiFi.disconnect(false, false);
+    return false;
+  }
+
+  Serial.print("WiFi OK. IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("WiFi channel: ");
+  Serial.println(WiFi.channel());
+  return true;
+}
+
 void onPacketReceived(const esp_now_recv_info_t* recv_info, const uint8_t* data, int len) {
+  if (len == sizeof(ScaleCommandPacket)) {
+    ScaleCommandPacket command = {};
+    memcpy(&command, data, sizeof(command));
+    command.command[sizeof(command.command) - 1] = '\0';
+    if (command.packetType == kPacketTypeScaleCommand) {
+      Serial.print("Command from ");
+      Serial.print(macToString(recv_info->src_addr));
+      Serial.print(" | seq=");
+      Serial.print(command.sequence);
+      Serial.print(" | command=");
+      Serial.println(command.command);
+      return;
+    }
+  }
+
   if (len != sizeof(DetectionPacket)) {
     Serial.printf("Ignored packet with unexpected size: %d\n", len);
     return;
@@ -61,6 +113,10 @@ void onPacketReceived(const esp_now_recv_info_t* recv_info, const uint8_t* data,
   DetectionPacket packet = {};
   memcpy(&packet, data, sizeof(packet));
   packet.label[sizeof(packet.label) - 1] = '\0';
+  if (packet.packetType != kPacketTypeDetectionResult) {
+    Serial.printf("Ignored packet with unknown type: %d\n", packet.packetType);
+    return;
+  }
   last_packet_ms = millis();
   char display_label[sizeof(packet.label) + sizeof(kLowConfidencePrefix)] = {};
 
@@ -93,10 +149,14 @@ void onPacketReceived(const esp_now_recv_info_t* recv_info, const uint8_t* data,
 }
 
 bool initEspNow() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  const bool wifiConnected = connectWifi();
 
-  if (esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+  uint8_t channel = WiFi.channel();
+  if (channel == 0) {
+    channel = 1;
+  }
+
+  if (!wifiConnected && esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
     Serial.println("Failed to set WiFi channel");
     return false;
   }
@@ -111,7 +171,7 @@ bool initEspNow() {
   Serial.print("Receiver MAC: ");
   Serial.println(WiFi.macAddress());
   Serial.print("ESP-NOW channel: ");
-  Serial.println(kEspNowChannel);
+  Serial.println(channel);
   return true;
 }
 

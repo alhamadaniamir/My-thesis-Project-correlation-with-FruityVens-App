@@ -6,6 +6,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <RTClib.h>
 #include "time.h"
 #include <math.h>
@@ -59,6 +61,28 @@ const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
 const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
 const uint8_t LOCK_MATCH_SAMPLES = 10;
 const size_t SALE_HISTORY_SIZE = 10;
+const float FRUIT_DETECTION_CONFIDENCE = 0.60;
+const unsigned long CAMERA_COMMAND_REPEAT_MS = 1000;
+const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 8000;
+const uint8_t PACKET_TYPE_SCALE_COMMAND = 1;
+const uint8_t PACKET_TYPE_DETECTION_RESULT = 2;
+
+uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+struct ScaleCommandPacket {
+  uint8_t packetType;
+  char command[16];
+  uint32_t sequence;
+  uint32_t uptime_ms;
+};
+
+struct DetectionPacket {
+  uint8_t packetType;
+  char label[32];
+  float confidence;
+  uint32_t sequence;
+  uint32_t uptime_ms;
+};
 
 struct SaleRecord {
   unsigned long id;
@@ -113,6 +137,12 @@ size_t saleHistoryCount = 0;
 SaleRecord saleHistory[SALE_HISTORY_SIZE];
 char currentFruitType[32] = "Unknown";
 unsigned long lastFirebaseRetryMs = 0;
+unsigned long lastCameraCommandMs = 0;
+unsigned long cameraDetectionStartedMs = 0;
+uint32_t cameraCommandSequence = 0;
+bool espNowReady = false;
+bool cameraDetectionRequested = false;
+bool cameraResultReceived = false;
 
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
@@ -120,6 +150,10 @@ String saleRecordJson(const SaleRecord& sale, const String& indent);
 String firebaseSafeKey(const char* value);
 String firebaseSafeKey(const String& value);
 bool uploadPendingSales();
+bool setupEspNow();
+void requestFruitDetection();
+void stopFruitDetection(bool clearFruit);
+void maintainFruitDetection();
 
 float calculatePrice(float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
@@ -210,6 +244,7 @@ void beepBuzzer(uint8_t beepCount) {
 }
 
 void resetWeightState() {
+  stopFruitDetection(true);
   weightLocked = false;
   objectPresent = false;
   lockedWeightGrams = 0.0;
@@ -317,6 +352,13 @@ void tareScale(const char* reason) {
 }
 
 SaleRecord confirmSale(const char* reason, const char* source) {
+  if (strcmp(currentFruitType, "Processing") == 0) {
+    strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
+    cameraResultReceived = true;
+    cameraDetectionRequested = false;
+    sendCameraCommand("STOP");
+  }
+
   SaleRecord sale = recordSale(source);
 
   Serial.print(reason);
@@ -342,6 +384,7 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   } else {
     showMessage("Saved for sync", line2);
   }
+  stopFruitDetection(false);
   beepBuzzer(1);
   return sale;
 }
@@ -374,6 +417,7 @@ void updateLockedWeight() {
   }
 
   if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
+    stopFruitDetection(true);
     objectPresent = false;
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
@@ -392,6 +436,7 @@ void updateLockedWeight() {
   }
 
   objectPresent = true;
+  requestFruitDetection();
   objectRemoveCount = 0;
   currentWeightGrams = liveWeightGrams;
   if (liveWeightGrams == lastLockCandidateGrams) {
@@ -477,6 +522,7 @@ void setupWifi() {
   lcd.setCursor(0, 1);
   lcd.print(ssid);
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
   int tries = 0;
@@ -498,6 +544,7 @@ void setupWifi() {
     lcd.print(WiFi.localIP().toString());
   } else {
     Serial.println("WiFi FAILED");
+    WiFi.disconnect(false, false);
     lcd.clear();
     lcd.print("WiFi failed");
     lcd.setCursor(0, 1);
@@ -506,6 +553,169 @@ void setupWifi() {
     lcd.print("Offline sync queue");
   }
   delay(WIFI_RESULT_DISPLAY_MS);
+}
+
+String macToString(const uint8_t* mac) {
+  char buffer[18];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%02X:%02X:%02X:%02X:%02X:%02X",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+  );
+  return String(buffer);
+}
+
+bool addEspNowBroadcastPeer() {
+  if (esp_now_is_peer_exist(broadcastPeer)) {
+    return true;
+  }
+
+  uint8_t channel = WiFi.channel();
+  if (channel == 0) {
+    channel = 1;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastPeer, 6);
+  peerInfo.channel = channel;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW broadcast peer");
+    return false;
+  }
+
+  return true;
+}
+
+void sendCameraCommand(const char* command) {
+  if (!espNowReady) {
+    return;
+  }
+
+  ScaleCommandPacket packet = {};
+  packet.packetType = PACKET_TYPE_SCALE_COMMAND;
+  strlcpy(packet.command, command, sizeof(packet.command));
+  packet.sequence = ++cameraCommandSequence;
+  packet.uptime_ms = millis();
+
+  esp_err_t result = esp_now_send(
+    broadcastPeer,
+    reinterpret_cast<uint8_t*>(&packet),
+    sizeof(packet)
+  );
+  if (result != ESP_OK) {
+    Serial.printf("Camera command %s failed: %d\n", command, result);
+  } else {
+    Serial.print("Camera command sent: ");
+    Serial.println(command);
+  }
+}
+
+void onEspNowReceived(const esp_now_recv_info_t* recvInfo, const uint8_t* data, int len) {
+  if (len != sizeof(DetectionPacket)) {
+    return;
+  }
+
+  DetectionPacket packet = {};
+  memcpy(&packet, data, sizeof(packet));
+  packet.label[sizeof(packet.label) - 1] = '\0';
+  if (packet.packetType != PACKET_TYPE_DETECTION_RESULT) {
+    return;
+  }
+
+  const bool confident =
+    packet.confidence >= FRUIT_DETECTION_CONFIDENCE &&
+    strcmp(packet.label, "Unknown") != 0;
+  strlcpy(
+    currentFruitType,
+    confident ? packet.label : "Unknown",
+    sizeof(currentFruitType)
+  );
+  cameraResultReceived = true;
+  cameraDetectionRequested = false;
+
+  Serial.print("Camera result from ");
+  Serial.print(macToString(recvInfo->src_addr));
+  Serial.print(": ");
+  Serial.print(currentFruitType);
+  Serial.print(" confidence=");
+  Serial.println(packet.confidence, 4);
+}
+
+bool setupEspNow() {
+  uint8_t channel = WiFi.channel();
+  if (channel == 0) {
+    channel = 1;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  }
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return false;
+  }
+
+  esp_now_register_recv_cb(onEspNowReceived);
+  if (!addEspNowBroadcastPeer()) {
+    return false;
+  }
+
+  espNowReady = true;
+  Serial.print("Scale MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("ESP-NOW channel: ");
+  Serial.println(channel);
+  return true;
+}
+
+void requestFruitDetection() {
+  if (cameraResultReceived) {
+    return;
+  }
+
+  if (!cameraDetectionRequested) {
+    cameraDetectionRequested = true;
+    cameraDetectionStartedMs = millis();
+    lastCameraCommandMs = 0;
+    strlcpy(currentFruitType, "Processing", sizeof(currentFruitType));
+  }
+
+  if (millis() - lastCameraCommandMs >= CAMERA_COMMAND_REPEAT_MS) {
+    sendCameraCommand("START");
+    lastCameraCommandMs = millis();
+  }
+}
+
+void stopFruitDetection(bool clearFruit) {
+  if (cameraDetectionRequested || cameraResultReceived) {
+    sendCameraCommand("STOP");
+  }
+  cameraDetectionRequested = false;
+  cameraResultReceived = false;
+  lastCameraCommandMs = 0;
+  cameraDetectionStartedMs = 0;
+  if (clearFruit) {
+    strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
+  }
+}
+
+void maintainFruitDetection() {
+  if (!cameraDetectionRequested || cameraResultReceived) {
+    return;
+  }
+
+  if (millis() - cameraDetectionStartedMs >= CAMERA_DETECTION_TIMEOUT_MS) {
+    strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
+    cameraDetectionRequested = false;
+    cameraResultReceived = true;
+    sendCameraCommand("STOP");
+    Serial.println("Camera detection timeout - fruit Unknown");
+    return;
+  }
+
+  requestFruitDetection();
 }
 
 void syncRtcFromNtp() {
@@ -686,29 +896,31 @@ void updateDisplay() {
   float billableWeightGrams = currentWeightGrams;
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = calculatePrice(billableWeightGrams);
+  float weightKg = billableWeightGrams / 1000.0;
+  char statusCode = 'Z';
+  if (weightLocked) {
+    statusCode = 'L';
+  } else if (objectPresent) {
+    statusCode = 'W';
+  }
 
   char line[21];
 
-  snprintf(line, sizeof(line), "Weight:%8.2f g", currentWeightGrams);
+  snprintf(line, sizeof(line), "Fruit:%-13.13s", currentFruitType);
   printPadded(0, 0, line);
 
-  snprintf(line, sizeof(line), "Price: PHP %7.2f", price);
+  snprintf(line, sizeof(line), "Wt:%5.2fkg P:%6.2f", weightKg, price);
   printPadded(0, 1, line);
-
-  if (weightLocked) {
-    snprintf(line, sizeof(line), "Status: locked");
-  } else if (objectPresent) {
-    snprintf(line, sizeof(line), "Status: weighing");
-  } else {
-    snprintf(line, sizeof(line), "Status: zero");
-  }
-  printPadded(0, 2, line);
 
   if (rtcReady) {
     DateTime now = rtc.now();
-    snprintf(line, sizeof(line), "%02d/%02d/%04d %02d:%02d",
-             now.month(), now.day(), now.year(), now.hour(), now.minute());
+    snprintf(line, sizeof(line), "Stat:%c %02d:%02d", statusCode, now.hour(), now.minute());
+    printPadded(0, 2, line);
+    snprintf(line, sizeof(line), "%02d/%02d/%04d",
+             now.month(), now.day(), now.year());
   } else {
+    snprintf(line, sizeof(line), "Stat:%c No RTC", statusCode);
+    printPadded(0, 2, line);
     snprintf(line, sizeof(line), "RTC not detected");
   }
   printPadded(0, 3, line);
@@ -836,6 +1048,9 @@ void setCurrentFruitType(const String& fruit) {
   }
 
   cleanFruit.toCharArray(currentFruitType, sizeof(currentFruitType));
+  cameraResultReceived = true;
+  cameraDetectionRequested = false;
+  sendCameraCommand("STOP");
   Serial.print("Current fruit set to: ");
   Serial.println(currentFruitType);
   showMessage("Fruit selected", currentFruitType);
@@ -937,6 +1152,7 @@ void setup() {
 
   setupRtc();
   setupWifi();
+  setupEspNow();
   syncRtcFromNtp();
   setupScale();
 
@@ -953,6 +1169,7 @@ void loop() {
     updateLockedWeight();
   }
 
+  maintainFruitDetection();
   handleButtons();
   processSerialCommand();
 
