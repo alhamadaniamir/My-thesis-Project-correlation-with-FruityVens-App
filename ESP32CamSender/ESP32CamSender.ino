@@ -628,9 +628,9 @@ bool initCamera() {
   camera_config.pin_reset = -1;
   camera_config.xclk_freq_hz = 20000000;
   camera_config.pixel_format = PIXFORMAT_RGB565;
-  camera_config.frame_size = FRAMESIZE_QQVGA;
+  camera_config.frame_size = psramFound() ? FRAMESIZE_QVGA : FRAMESIZE_QQVGA;
   camera_config.jpeg_quality = 12;
-  camera_config.fb_count = 1;
+  camera_config.fb_count = psramFound() ? 2 : 1;
   camera_config.grab_mode = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
@@ -647,7 +647,14 @@ bool initCamera() {
   if (sensor != nullptr) {
     sensor->set_vflip(sensor, 1);
     sensor->set_brightness(sensor, 1);
-    sensor->set_saturation(sensor, -1);
+    sensor->set_contrast(sensor, 1);
+    sensor->set_saturation(sensor, 1);
+    sensor->set_whitebal(sensor, 1);
+    sensor->set_awb_gain(sensor, 1);
+    sensor->set_gain_ctrl(sensor, 1);
+    sensor->set_exposure_ctrl(sensor, 1);
+    sensor->set_aec2(sensor, 1);
+    sensor->set_lenc(sensor, 1);
   }
 
   return true;
