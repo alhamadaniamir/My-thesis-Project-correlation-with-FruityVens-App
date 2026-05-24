@@ -42,13 +42,15 @@ const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0;
 const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
 const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
 const float CALIBRATION_STEP = 0.001;
-const float pricePerKg = 60.0;
+const float DEFAULT_PRICE_PER_KG = 60.0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
 const unsigned long WIFI_RESULT_DISPLAY_MS = 2000;
 const unsigned long TARE_TIMEOUT_MS = 5000;
+const unsigned long PRICE_UPDATE_POLL_MS = 5000;
+const unsigned long PRICE_TABLE_REFRESH_MS = 60000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 const float OBJECT_DETECT_GRAMS = 5.0;
@@ -84,10 +86,16 @@ struct DetectionPacket {
   uint32_t uptime_ms;
 };
 
+struct FruitPrice {
+  const char* fruitType;
+  float pricePerKg;
+};
+
 struct SaleRecord {
   unsigned long id;
   float weightGrams;
   float price;
+  float pricePerKg;
   char fruitType[32];
   char timestamp[25];
   char date[11];
@@ -95,6 +103,42 @@ struct SaleRecord {
   char source[16];
   char firebaseKey[80];
   unsigned long createdAtMs;
+};
+
+FruitPrice fruitPrices[] = {
+  {"Apple", 90.0},
+  {"Orange", 85.0},
+  {"Banana", 35.0},
+  {"Mango", 60.0},
+  {"Grapes", 130.0},
+  {"Lemon", 70.0},
+  {"Papaya", 50.0},
+  {"Watermelon", 50.0},
+  {"Pineapple", 45.0},
+  {"Calamansi", 65.0},
+  {"Pomelo", 95.0},
+  {"Guava", 50.0},
+  {"Avocado", 110.0},
+  {"Coconut", 35.0},
+  {"Dalandan", 75.0},
+  {"Dragon Fruit", 140.0},
+  {"Durian", 180.0},
+  {"Mangosteen", 160.0},
+  {"Rambutan", 120.0},
+  {"Lanzones", 120.0},
+  {"Chico", 80.0},
+  {"Atis", 95.0},
+  {"Santol", 70.0},
+  {"Star Apple", 90.0},
+  {"Jackfruit", 65.0},
+  {"Tamarind", 75.0},
+  {"Melon", 55.0},
+  {"Guyabano", 100.0},
+  {"Mango Carabao", 80.0},
+  {"Indian Mango", 75.0},
+  {"Langkatan", 45.0},
+  {"Pear", 95.0},
+  {"Strawberries", 120.0},
 };
 
 hd44780_I2Cexp lcd(0x27);
@@ -137,6 +181,9 @@ size_t saleHistoryCount = 0;
 SaleRecord saleHistory[SALE_HISTORY_SIZE];
 char currentFruitType[32] = "Unknown";
 unsigned long lastFirebaseRetryMs = 0;
+unsigned long lastPriceUpdatePollMs = 0;
+unsigned long lastPriceTableRefreshMs = 0;
+String lastPriceUpdateVersion = "";
 unsigned long lastCameraCommandMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
 uint32_t cameraCommandSequence = 0;
@@ -154,10 +201,19 @@ bool setupEspNow();
 void requestFruitDetection();
 void stopFruitDetection(bool clearFruit);
 void maintainFruitDetection();
+void maintainPriceUpdates();
+bool fetchPriceTable();
+bool fetchLatestPriceUpdate();
+float pricePerKgForFruit(const char* fruitType);
 
 float calculatePrice(float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
-  return (weightGrams / 1000.0) * pricePerKg;
+  return (weightGrams / 1000.0) * pricePerKgForFruit(currentFruitType);
+}
+
+float calculatePriceForFruit(const char* fruitType, float weightGrams) {
+  if (weightGrams < 0) weightGrams = 0;
+  return (weightGrams / 1000.0) * pricePerKgForFruit(fruitType);
 }
 
 const char* scaleStatusText() {
@@ -196,6 +252,41 @@ void printPadded(uint8_t col, uint8_t row, const char* text) {
   for (uint8_t i = strlen(text); i < LCD_COLS - col; i++) {
     lcd.print(' ');
   }
+}
+
+float pricePerKgForFruit(const char* fruitType) {
+  if (fruitType == nullptr || strlen(fruitType) == 0) {
+    return DEFAULT_PRICE_PER_KG;
+  }
+
+  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
+    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0) {
+      return fruitPrices[i].pricePerKg;
+    }
+  }
+  return DEFAULT_PRICE_PER_KG;
+}
+
+bool setFruitPrice(const char* fruitType, float pricePerKg) {
+  if (fruitType == nullptr || strlen(fruitType) == 0 || pricePerKg <= 0.0f) {
+    return false;
+  }
+
+  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
+    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0) {
+      fruitPrices[i].pricePerKg = pricePerKg;
+      Serial.print("Price updated: ");
+      Serial.print(fruitType);
+      Serial.print(" = PHP ");
+      Serial.print(pricePerKg, 2);
+      Serial.println("/kg");
+      return true;
+    }
+  }
+
+  Serial.print("Ignored price update for unmanaged fruit: ");
+  Serial.println(fruitType);
+  return false;
 }
 
 void beginButton(ButtonState &button) {
@@ -810,11 +901,11 @@ String saleRecordJson(const SaleRecord& sale, const String& indent) {
   body += ",\n";
   body += indent;
   body += "\"pricePerKg\": ";
-  body += String(pricePerKg, 2);
+  body += String(sale.pricePerKg, 2);
   body += ",\n";
   body += indent;
   body += "\"pricePerKgCentavos\": ";
-  body += String((int)round(pricePerKg * 100.0));
+  body += String((int)round(sale.pricePerKg * 100.0));
   body += ",\n";
   body += indent;
   body += "\"fruitType\": \"";
@@ -868,9 +959,10 @@ SaleRecord recordSale(const char* source) {
   SaleRecord sale = {};
   sale.id = nextSaleId++;
   sale.weightGrams = currentWeightGrams;
-  sale.price = calculatePrice(currentWeightGrams);
-  sale.createdAtMs = millis();
   strlcpy(sale.fruitType, currentFruitType, sizeof(sale.fruitType));
+  sale.pricePerKg = pricePerKgForFruit(sale.fruitType);
+  sale.price = calculatePriceForFruit(sale.fruitType, currentWeightGrams);
+  sale.createdAtMs = millis();
   strlcpy(sale.source, source, sizeof(sale.source));
   copyCurrentDateTime(sale.timestamp, sizeof(sale.timestamp),
                       sale.date, sizeof(sale.date),
@@ -960,23 +1052,246 @@ String firebaseSaleKey(const SaleRecord& sale) {
   return firebaseSafeKey(key);
 }
 
-String firebaseRequestUrl(const SaleRecord& sale) {
+String firebaseBaseUrl() {
   String base = firebaseDatabaseUrl;
   while (base.endsWith("/")) {
     base.remove(base.length() - 1);
   }
+  return base;
+}
 
-  String url = base;
-  url += "/scaleSales/";
-  url += firebaseSafeKey(firebaseScaleDeviceId);
-  url += "/";
-  url += firebaseSaleKey(sale);
+String firebaseUrlForPath(const String& path) {
+  String url = firebaseBaseUrl();
+  if (!path.startsWith("/")) {
+    url += "/";
+  }
+  url += path;
   url += ".json";
   if (strlen(firebaseAuthToken) > 0) {
     url += "?auth=";
     url += firebaseAuthToken;
   }
   return url;
+}
+
+String firebaseRequestUrl(const SaleRecord& sale) {
+  String path = "scaleSales/";
+  path += firebaseSafeKey(firebaseScaleDeviceId);
+  path += "/";
+  path += firebaseSaleKey(sale);
+  return firebaseUrlForPath(path);
+}
+
+int jsonValueStart(const String& json, const char* key, int searchFrom = 0) {
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+  int keyIndex = json.indexOf(pattern, searchFrom);
+  if (keyIndex < 0) {
+    return -1;
+  }
+
+  int colonIndex = json.indexOf(':', keyIndex + pattern.length());
+  if (colonIndex < 0) {
+    return -1;
+  }
+
+  int valueStart = colonIndex + 1;
+  while (valueStart < json.length()) {
+    char c = json.charAt(valueStart);
+    if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+      break;
+    }
+    valueStart++;
+  }
+  return valueStart;
+}
+
+bool extractJsonString(const String& json, const char* key, String& value, int searchFrom = 0) {
+  int start = jsonValueStart(json, key, searchFrom);
+  if (start < 0 || start >= json.length() || json.charAt(start) != '"') {
+    return false;
+  }
+
+  String parsed = "";
+  bool escaped = false;
+  for (int i = start + 1; i < json.length(); i++) {
+    char c = json.charAt(i);
+    if (escaped) {
+      parsed += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '"') {
+      value = parsed;
+      return true;
+    } else {
+      parsed += c;
+    }
+  }
+  return false;
+}
+
+bool isJsonNumberChar(char c) {
+  return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
+}
+
+bool extractJsonNumber(const String& json, const char* key, String& value, int searchFrom = 0) {
+  int start = jsonValueStart(json, key, searchFrom);
+  if (start < 0 || start >= json.length()) {
+    return false;
+  }
+
+  int end = start;
+  while (end < json.length() && isJsonNumberChar(json.charAt(end))) {
+    end++;
+  }
+
+  if (end == start) {
+    return false;
+  }
+
+  value = json.substring(start, end);
+  return true;
+}
+
+bool getFirebaseJson(const String& path, String& payload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(3000);
+  const String url = firebaseUrlForPath(path);
+  if (!http.begin(client, url)) {
+    Serial.println("Firebase read failed: could not start HTTPS request");
+    return false;
+  }
+
+  const int statusCode = http.GET();
+  payload = http.getString();
+  http.end();
+
+  if (statusCode < 200 || statusCode >= 300) {
+    Serial.print("Firebase read HTTP ");
+    Serial.print(statusCode);
+    Serial.print(": ");
+    Serial.println(payload);
+    return false;
+  }
+
+  return true;
+}
+
+bool applyPriceObject(const String& json, int searchFrom = 0) {
+  String fruit;
+  if (!extractJsonString(json, "fruit", fruit, searchFrom)) {
+    return false;
+  }
+
+  String priceCentavosText;
+  float price = 0.0f;
+  if (extractJsonNumber(json, "priceCentavos", priceCentavosText, searchFrom)) {
+    price = priceCentavosText.toInt() / 100.0f;
+  } else {
+    String priceText;
+    if (extractJsonNumber(json, "price", priceText, searchFrom)) {
+      price = priceText.toFloat();
+    }
+  }
+
+  if (price <= 0.0f) {
+    Serial.print("Ignored invalid price update for ");
+    Serial.println(fruit);
+    return false;
+  }
+
+  char fruitBuffer[32];
+  fruit.toCharArray(fruitBuffer, sizeof(fruitBuffer));
+  return setFruitPrice(fruitBuffer, price);
+}
+
+bool applyPriceTablePayload(const String& payload) {
+  if (payload.length() == 0 || payload == "null") {
+    return false;
+  }
+
+  bool updatedAny = false;
+  int searchFrom = 0;
+  while (true) {
+    int fruitIndex = payload.indexOf("\"fruit\"", searchFrom);
+    if (fruitIndex < 0) {
+      break;
+    }
+    if (applyPriceObject(payload, fruitIndex)) {
+      updatedAny = true;
+    }
+    searchFrom = fruitIndex + 7;
+  }
+  return updatedAny;
+}
+
+bool fetchPriceTable() {
+  String path = "scalePriceUpdates/";
+  path += firebaseSafeKey(firebaseScaleDeviceId);
+  path += "/fruits";
+
+  String payload;
+  if (!getFirebaseJson(path, payload)) {
+    return false;
+  }
+
+  const bool updated = applyPriceTablePayload(payload);
+  if (updated) {
+    Serial.println("Scale price table synced from Firebase");
+  }
+  return true;
+}
+
+bool fetchLatestPriceUpdate() {
+  String path = "scalePriceUpdates/";
+  path += firebaseSafeKey(firebaseScaleDeviceId);
+  path += "/latest";
+
+  String payload;
+  if (!getFirebaseJson(path, payload) || payload.length() == 0 || payload == "null") {
+    return false;
+  }
+
+  String version;
+  if (!extractJsonNumber(payload, "version", version)) {
+    version = payload;
+  }
+
+  if (version == lastPriceUpdateVersion) {
+    return true;
+  }
+
+  const bool appliedLatest = applyPriceObject(payload);
+  lastPriceUpdateVersion = version;
+  fetchPriceTable();
+  return appliedLatest;
+}
+
+void maintainPriceUpdates() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (lastPriceTableRefreshMs == 0 ||
+      now - lastPriceTableRefreshMs >= PRICE_TABLE_REFRESH_MS) {
+    lastPriceTableRefreshMs = now;
+    fetchPriceTable();
+  }
+
+  if (now - lastPriceUpdatePollMs >= PRICE_UPDATE_POLL_MS) {
+    lastPriceUpdatePollMs = now;
+    fetchLatestPriceUpdate();
+  }
 }
 
 bool uploadSaleToFirebase(const SaleRecord& sale) {
@@ -1155,6 +1470,7 @@ void setup() {
   setupEspNow();
   syncRtcFromNtp();
   setupScale();
+  maintainPriceUpdates();
 
   showMessage(hx711Ready ? "Ready!" : "Scale not ready");
 }
@@ -1170,6 +1486,7 @@ void loop() {
   }
 
   maintainFruitDetection();
+  maintainPriceUpdates();
   handleButtons();
   processSerialCommand();
 
