@@ -61,6 +61,7 @@ const float NOISE_FLOOR_GRAMS = 2.0;
 const float WEIGHT_FILTER_ALPHA = 0.45;
 const float FAST_WEIGHT_FILTER_ALPHA = 0.85;
 const float FAST_WEIGHT_DELTA_GRAMS = 20.0;
+const float LOCK_STABLE_TOLERANCE_GRAMS = 1.0;
 const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
 const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
 const uint8_t LOCK_MATCH_SAMPLES = 10;
@@ -168,6 +169,7 @@ unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
 unsigned long messageUntilMs = 0;
 float lastLockCandidateGrams = 0.0;
+float lockWeightSumGrams = 0.0;
 float lockedWeightGrams = 0.0;
 float filteredWeightGrams = 0.0;
 float lastSensorWeightGrams = 0.0;
@@ -182,6 +184,7 @@ bool newScaleData = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
 uint8_t lockMatchCount = 0;
+uint8_t lockWeightSampleCount = 0;
 unsigned long nextSaleId = 1;
 unsigned long latestSaleId = 0;
 size_t saleHistoryCount = 0;
@@ -381,6 +384,7 @@ void resetWeightState() {
   lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
   lastLockCandidateGrams = 0.0;
+  lockWeightSumGrams = 0.0;
   filteredWeightGrams = 0.0;
   lastSensorWeightGrams = 0.0;
   lastProcessedWeightGrams = 0.0;
@@ -389,6 +393,7 @@ void resetWeightState() {
   objectDetectCount = 0;
   objectRemoveCount = 0;
   lockMatchCount = 0;
+  lockWeightSampleCount = 0;
   objectPresentStartedMs = 0;
 }
 
@@ -473,12 +478,21 @@ void printScaleDiagnostics() {
   Serial.print(currentWeightGrams, 2);
   Serial.print("g locked=");
   Serial.print(lockedWeightGrams, 2);
+  Serial.print("g avg=");
+  if (lockWeightSampleCount > 0) {
+    Serial.print(lockWeightSumGrams / lockWeightSampleCount, 2);
+  } else {
+    Serial.print("0.00");
+  }
   Serial.print("g filter=");
   Serial.print(lastFilterAlpha, 2);
   Serial.print(" lock=");
   Serial.print(static_cast<unsigned int>(lockMatchCount));
   Serial.print("/");
   Serial.print(static_cast<unsigned int>(LOCK_MATCH_SAMPLES));
+  Serial.print(" tol=");
+  Serial.print(LOCK_STABLE_TOLERANCE_GRAMS, 1);
+  Serial.print("g");
   Serial.print(" fruit=");
   Serial.print(currentFruitType);
   Serial.print(" cal=");
@@ -631,7 +645,9 @@ void updateLockedWeight() {
     objectDetectCount = 0;
     objectRemoveCount = 0;
     lockMatchCount = 0;
+    lockWeightSampleCount = 0;
     lastLockCandidateGrams = 0.0;
+    lockWeightSumGrams = 0.0;
     objectPresentStartedMs = 0;
     return;
   }
@@ -640,7 +656,9 @@ void updateLockedWeight() {
     objectDetectCount++;
     currentWeightGrams = 0.0;
     lockMatchCount = 1;
+    lockWeightSampleCount = 1;
     lastLockCandidateGrams = liveWeightGrams;
+    lockWeightSumGrams = liveWeightGrams;
     return;
   }
 
@@ -656,19 +674,28 @@ void updateLockedWeight() {
   }
   objectRemoveCount = 0;
   currentWeightGrams = liveWeightGrams;
-  if (liveWeightGrams == lastLockCandidateGrams) {
-    if (lockMatchCount < LOCK_MATCH_SAMPLES) lockMatchCount++;
+  if (fabs(liveWeightGrams - lastLockCandidateGrams) <= LOCK_STABLE_TOLERANCE_GRAMS) {
+    if (lockMatchCount < LOCK_MATCH_SAMPLES) {
+      lockMatchCount++;
+      lockWeightSampleCount++;
+      lockWeightSumGrams += liveWeightGrams;
+    }
   } else {
     lastLockCandidateGrams = liveWeightGrams;
     lockMatchCount = 1;
+    lockWeightSampleCount = 1;
+    lockWeightSumGrams = liveWeightGrams;
   }
 
   if (lockMatchCount >= LOCK_MATCH_SAMPLES) {
-    lockedWeightGrams = liveWeightGrams;
+    const float averageStableWeightGrams = lockWeightSumGrams / lockWeightSampleCount;
+    lockedWeightGrams = round(averageStableWeightGrams);
     currentWeightGrams = lockedWeightGrams;
     weightLocked = true;
     Serial.print("Weight locked(g): ");
-    Serial.println(lockedWeightGrams, 1);
+    Serial.print(lockedWeightGrams, 0);
+    Serial.print(" avg=");
+    Serial.println(averageStableWeightGrams, 2);
   }
 }
 
