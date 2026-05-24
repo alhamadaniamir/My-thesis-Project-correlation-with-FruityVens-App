@@ -43,13 +43,15 @@ const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
 const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
 const float CALIBRATION_STEP = 0.001;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
-const unsigned long BUTTON_DEBOUNCE_MS = 80;
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
 const unsigned long WIFI_RESULT_DISPLAY_MS = 2000;
 const unsigned long TARE_TIMEOUT_MS = 5000;
 const unsigned long PRICE_UPDATE_POLL_MS = 5000;
 const unsigned long PRICE_TABLE_REFRESH_MS = 60000;
+const unsigned long FIREBASE_HTTP_TIMEOUT_MS = 1500;
+const unsigned long FIREBASE_RETRY_MS = 5000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 const float OBJECT_DETECT_GRAMS = 5.0;
@@ -64,7 +66,6 @@ const uint8_t LOCK_MATCH_SAMPLES = 10;
 const size_t SALE_HISTORY_SIZE = 10;
 const float FRUIT_DETECTION_CONFIDENCE = 0.0;
 const unsigned long CAMERA_START_DELAY_MS = 1000;
-const unsigned long CAMERA_COMMAND_REPEAT_MS = 1000;
 const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 12000;
 const uint8_t PACKET_TYPE_SCALE_COMMAND = 1;
 const uint8_t PACKET_TYPE_DETECTION_RESULT = 2;
@@ -185,12 +186,12 @@ unsigned long lastPriceUpdatePollMs = 0;
 unsigned long lastPriceTableRefreshMs = 0;
 String lastPriceUpdateVersion = "";
 unsigned long objectPresentStartedMs = 0;
-unsigned long lastCameraCommandMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
 uint32_t cameraCommandSequence = 0;
 bool espNowReady = false;
 bool cameraDetectionRequested = false;
 bool cameraResultReceived = false;
+bool cameraScanAttemptedForCurrentObject = false;
 bool saleConfirmedForCurrentObject = false;
 
 SaleRecord recordSale(const char* source);
@@ -369,6 +370,7 @@ void resetWeightState() {
   stopFruitDetection(true);
   weightLocked = false;
   objectPresent = false;
+  cameraScanAttemptedForCurrentObject = false;
   saleConfirmedForCurrentObject = false;
   lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
@@ -528,12 +530,7 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   char line2[21];
   snprintf(line2, sizeof(line2), "PHP %.2f", sale.price);
   showMessage("Sale confirmed", line2);
-  const bool uploaded = uploadPendingSales();
-  if (uploaded) {
-    showMessage("Firebase synced", line2);
-  } else {
-    showMessage("Saved for sync", line2);
-  }
+  lastFirebaseRetryMs = millis();
   saleConfirmedForCurrentObject = true;
   stopFruitDetection(false);
   beepBuzzer(1);
@@ -568,6 +565,7 @@ void updateLockedWeight() {
 
     if (!cameraResultReceived &&
         !cameraDetectionRequested &&
+        !cameraScanAttemptedForCurrentObject &&
         objectPresentStartedMs != 0 &&
         millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
       requestFruitDetection();
@@ -578,6 +576,7 @@ void updateLockedWeight() {
   if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
     stopFruitDetection(true);
     objectPresent = false;
+    cameraScanAttemptedForCurrentObject = false;
     saleConfirmedForCurrentObject = false;
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
@@ -602,6 +601,7 @@ void updateLockedWeight() {
   }
   objectPresent = true;
   if (!cameraResultReceived &&
+      !cameraScanAttemptedForCurrentObject &&
       millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
     requestFruitDetection();
   }
@@ -839,21 +839,15 @@ bool setupEspNow() {
 }
 
 void requestFruitDetection() {
-  if (cameraResultReceived) {
+  if (cameraResultReceived || cameraScanAttemptedForCurrentObject) {
     return;
   }
 
-  if (!cameraDetectionRequested) {
-    cameraDetectionRequested = true;
-    cameraDetectionStartedMs = millis();
-    lastCameraCommandMs = 0;
-    strlcpy(currentFruitType, "Processing", sizeof(currentFruitType));
-  }
-
-  if (millis() - lastCameraCommandMs >= CAMERA_COMMAND_REPEAT_MS) {
-    sendCameraCommand("START");
-    lastCameraCommandMs = millis();
-  }
+  cameraScanAttemptedForCurrentObject = true;
+  cameraDetectionRequested = true;
+  cameraDetectionStartedMs = millis();
+  strlcpy(currentFruitType, "Processing", sizeof(currentFruitType));
+  sendCameraCommand("START");
 }
 
 void stopFruitDetection(bool clearFruit) {
@@ -863,8 +857,8 @@ void stopFruitDetection(bool clearFruit) {
   cameraDetectionRequested = false;
   if (clearFruit) {
     cameraResultReceived = false;
+    cameraScanAttemptedForCurrentObject = false;
   }
-  lastCameraCommandMs = 0;
   cameraDetectionStartedMs = 0;
   if (clearFruit) {
     strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
@@ -884,8 +878,6 @@ void maintainFruitDetection() {
     Serial.println("Camera detection timeout - fruit Unknown");
     return;
   }
-
-  requestFruitDetection();
 }
 
 void syncRtcFromNtp() {
@@ -1248,7 +1240,7 @@ bool getFirebaseJson(const String& path, String& payload) {
   client.setInsecure();
 
   HTTPClient http;
-  http.setTimeout(3000);
+  http.setTimeout(FIREBASE_HTTP_TIMEOUT_MS);
   const String url = firebaseUrlForPath(path);
   if (!http.begin(client, url)) {
     Serial.println("Firebase read failed: could not start HTTPS request");
@@ -1388,6 +1380,7 @@ bool uploadSaleToFirebase(const SaleRecord& sale) {
   client.setInsecure();
 
   HTTPClient http;
+  http.setTimeout(FIREBASE_HTTP_TIMEOUT_MS);
   const String url = firebaseRequestUrl(sale);
   if (!http.begin(client, url)) {
     Serial.println("Firebase upload failed: could not start HTTPS request");
@@ -1449,6 +1442,7 @@ void setCurrentFruitType(const String& fruit) {
   cleanFruit.toCharArray(currentFruitType, sizeof(currentFruitType));
   cameraResultReceived = true;
   cameraDetectionRequested = false;
+  cameraScanAttemptedForCurrentObject = true;
   sendCameraCommand("STOP");
   Serial.print("Current fruit set to: ");
   Serial.println(currentFruitType);
@@ -1569,14 +1563,14 @@ void loop() {
     updateLockedWeight();
   }
 
-  maintainFruitDetection();
-  maintainPriceUpdates();
   handleButtons();
   processSerialCommand();
+  maintainFruitDetection();
+  maintainPriceUpdates();
 
   if (WiFi.status() == WL_CONNECTED &&
       saleHistoryCount > 0 &&
-      millis() - lastFirebaseRetryMs >= 5000) {
+      millis() - lastFirebaseRetryMs >= FIREBASE_RETRY_MS) {
     lastFirebaseRetryMs = millis();
     uploadPendingSales();
   }
