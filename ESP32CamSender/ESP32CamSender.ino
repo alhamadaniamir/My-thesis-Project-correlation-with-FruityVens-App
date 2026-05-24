@@ -20,12 +20,12 @@ constexpr char kWifiPassword[] = "C0E277DF";
 constexpr int kLedPin = 13;
 constexpr int kInputSize = 96;
 constexpr size_t kTensorArenaSize = 1024 * 1024;
-constexpr float kDetectionThreshold = 0.60f;
+constexpr float kDetectionThreshold = 0.0f;
 constexpr uint32_t kPlacementSettleMs = 1200;
 constexpr uint32_t kDetectionIntervalMs = 450;
 constexpr uint32_t kDetectionTimeoutMs = 12000;
-constexpr uint8_t kDetectionSampleFrames = 5;
-constexpr uint8_t kRequiredMatchingFrames = 3;
+constexpr uint8_t kDetectionSampleFrames = 10;
+constexpr uint8_t kRequiredMatchingFrames = 5;
 constexpr uint32_t kPreviewIdleTimeoutMs = 20000;
 constexpr uint8_t kSnapshotJpegQuality = 80;
 
@@ -795,7 +795,7 @@ void findTopPrediction(int& best_index, float& best_probability) {
 
 void recordDetectionVote(const char* label, float confidence) {
   detection_frames_seen++;
-  if (strcmp(label, "Unknown") == 0 || confidence < kDetectionThreshold) {
+  if (strcmp(label, "Unknown") == 0) {
     return;
   }
 
@@ -971,8 +971,7 @@ void loop() {
   findTopPrediction(best_index, best_probability);
 
   const char* raw_label = mapLabel(g_class_labels[best_index]);
-  const char* predicted_label =
-    best_probability >= kDetectionThreshold ? normalizeFruitName(raw_label) : "Unknown";
+  const char* predicted_label = normalizeFruitName(raw_label);
   recordDetectionVote(predicted_label, best_probability);
 
   strlcpy(latest_label, "Processing", sizeof(latest_label));
