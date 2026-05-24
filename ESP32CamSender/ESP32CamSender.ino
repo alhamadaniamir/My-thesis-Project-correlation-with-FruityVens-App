@@ -64,6 +64,13 @@ struct DetectionVote {
   float best_confidence;
 };
 
+struct RoiRect {
+  int x;
+  int y;
+  int w;
+  int h;
+};
+
 struct LabelMapEntry {
   const char* raw_label;
   const char* mapped_label;
@@ -257,6 +264,51 @@ const char* normalizeFruitName(const char* label) {
   if (labelStartsWith(label, "Strawberry")) return "Strawberries";
   if (labelStartsWith(label, "Watermelon")) return "Watermelon";
   return label;
+}
+
+RoiRect computeRoiRect(int src_w, int src_h) {
+  RoiRect roi = {};
+  roi.w = max(1, min(src_w, static_cast<int>(src_w * kRoiW)));
+  roi.h = max(1, min(src_h, static_cast<int>(src_h * kRoiH)));
+  const int max_x_offset = max(0, src_w - roi.w);
+  const int max_y_offset = max(0, src_h - roi.h);
+  roi.x = max(0, min(max_x_offset, static_cast<int>(src_w * kRoiX)));
+  roi.y = max(0, min(max_y_offset, static_cast<int>(src_h * kRoiY)));
+  return roi;
+}
+
+void setRgb565Pixel(camera_fb_t* fb, int x, int y, uint16_t color) {
+  if (x < 0 || y < 0 || x >= fb->width || y >= fb->height) {
+    return;
+  }
+
+  const int index = (y * fb->width + x) * 2;
+  fb->buf[index] = color & 0xFF;
+  fb->buf[index + 1] = color >> 8;
+}
+
+void drawRoiBox(camera_fb_t* fb) {
+  if (fb == nullptr || fb->format != PIXFORMAT_RGB565) {
+    return;
+  }
+
+  const RoiRect roi = computeRoiRect(fb->width, fb->height);
+  const uint16_t red = 0xF800;
+  const int x1 = roi.x;
+  const int y1 = roi.y;
+  const int x2 = roi.x + roi.w - 1;
+  const int y2 = roi.y + roi.h - 1;
+
+  for (int thickness = 0; thickness < 3; ++thickness) {
+    for (int x = x1; x <= x2; ++x) {
+      setRgb565Pixel(fb, x, y1 + thickness, red);
+      setRgb565Pixel(fb, x, y2 - thickness, red);
+    }
+    for (int y = y1; y <= y2; ++y) {
+      setRgb565Pixel(fb, x1 + thickness, y, red);
+      setRgb565Pixel(fb, x2 - thickness, y, red);
+    }
+  }
 }
 
 bool cameraOutputActive() {
@@ -456,6 +508,8 @@ void handleSnapshotRequest() {
     web_server.send(503, "text/plain", "Camera capture failed");
     return;
   }
+
+  drawRoiBox(fb);
 
   uint8_t* jpg_buffer = nullptr;
   size_t jpg_length = 0;
@@ -719,17 +773,12 @@ bool initTflm() {
 void preprocessFrame(camera_fb_t* fb, TfLiteTensor* input) {
   const int src_w = fb->width;
   const int src_h = fb->height;
-  const int roi_w = max(1, min(src_w, static_cast<int>(src_w * kRoiW)));
-  const int roi_h = max(1, min(src_h, static_cast<int>(src_h * kRoiH)));
-  const int max_x_offset = max(0, src_w - roi_w);
-  const int max_y_offset = max(0, src_h - roi_h);
-  const int x_offset = max(0, min(max_x_offset, static_cast<int>(src_w * kRoiX)));
-  const int y_offset = max(0, min(max_y_offset, static_cast<int>(src_h * kRoiY)));
+  const RoiRect roi = computeRoiRect(src_w, src_h);
 
   for (int y = 0; y < kInputSize; ++y) {
-    int src_y = y_offset + (y * roi_h) / kInputSize;
+    int src_y = roi.y + (y * roi.h) / kInputSize;
     for (int x = 0; x < kInputSize; ++x) {
-      int src_x = x_offset + (x * roi_w) / kInputSize;
+      int src_x = roi.x + (x * roi.w) / kInputSize;
       int index = (src_y * src_w + src_x) * 2;
       uint16_t pixel = static_cast<uint16_t>(fb->buf[index]) |
                        (static_cast<uint16_t>(fb->buf[index + 1]) << 8);
