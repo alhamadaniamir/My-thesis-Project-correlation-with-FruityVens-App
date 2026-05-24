@@ -42,7 +42,6 @@ const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0;
 const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
 const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
 const float CALIBRATION_STEP = 0.001;
-const float DEFAULT_PRICE_PER_KG = 60.0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long BUTTON_DEBOUNCE_MS = 80;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
@@ -64,8 +63,9 @@ const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
 const uint8_t LOCK_MATCH_SAMPLES = 10;
 const size_t SALE_HISTORY_SIZE = 10;
 const float FRUIT_DETECTION_CONFIDENCE = 0.60;
+const unsigned long CAMERA_START_DELAY_MS = 1000;
 const unsigned long CAMERA_COMMAND_REPEAT_MS = 1000;
-const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 8000;
+const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 12000;
 const uint8_t PACKET_TYPE_SCALE_COMMAND = 1;
 const uint8_t PACKET_TYPE_DETECTION_RESULT = 2;
 
@@ -184,6 +184,7 @@ unsigned long lastFirebaseRetryMs = 0;
 unsigned long lastPriceUpdatePollMs = 0;
 unsigned long lastPriceTableRefreshMs = 0;
 String lastPriceUpdateVersion = "";
+unsigned long objectPresentStartedMs = 0;
 unsigned long lastCameraCommandMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
 uint32_t cameraCommandSequence = 0;
@@ -204,6 +205,7 @@ void maintainFruitDetection();
 void maintainPriceUpdates();
 bool fetchPriceTable();
 bool fetchLatestPriceUpdate();
+bool hasFruitPrice(const char* fruitType);
 float pricePerKgForFruit(const char* fruitType);
 
 float calculatePrice(float weightGrams) {
@@ -254,9 +256,23 @@ void printPadded(uint8_t col, uint8_t row, const char* text) {
   }
 }
 
+bool hasFruitPrice(const char* fruitType) {
+  if (fruitType == nullptr || strlen(fruitType) == 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
+    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0 &&
+        fruitPrices[i].pricePerKg > 0.0f) {
+      return true;
+    }
+  }
+  return false;
+}
+
 float pricePerKgForFruit(const char* fruitType) {
   if (fruitType == nullptr || strlen(fruitType) == 0) {
-    return DEFAULT_PRICE_PER_KG;
+    return 0.0f;
   }
 
   for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
@@ -264,7 +280,7 @@ float pricePerKgForFruit(const char* fruitType) {
       return fruitPrices[i].pricePerKg;
     }
   }
-  return DEFAULT_PRICE_PER_KG;
+  return 0.0f;
 }
 
 bool setFruitPrice(const char* fruitType, float pricePerKg) {
@@ -345,6 +361,7 @@ void resetWeightState() {
   objectDetectCount = 0;
   objectRemoveCount = 0;
   lockMatchCount = 0;
+  objectPresentStartedMs = 0;
 }
 
 void persistCalibrationFactor(float value) {
@@ -443,11 +460,37 @@ void tareScale(const char* reason) {
 }
 
 SaleRecord confirmSale(const char* reason, const char* source) {
-  if (strcmp(currentFruitType, "Processing") == 0) {
-    strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
-    cameraResultReceived = true;
-    cameraDetectionRequested = false;
-    sendCameraCommand("STOP");
+  if (currentWeightGrams < OBJECT_DETECT_GRAMS) {
+    showMessage("No item on scale");
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
+  if (cameraDetectionRequested ||
+      strcmp(currentFruitType, "Processing") == 0 ||
+      strcmp(currentFruitType, "Settling") == 0 ||
+      !cameraResultReceived) {
+    showMessage("Detecting fruit", "Please wait");
+    if (objectPresentStartedMs != 0 &&
+        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
+      requestFruitDetection();
+    }
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
+  if (strcmp(currentFruitType, "Unknown") == 0) {
+    cameraResultReceived = false;
+    requestFruitDetection();
+    showMessage("Check fruit", "Retrying scan");
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
+  if (!hasFruitPrice(currentFruitType)) {
+    showMessage("No price set", currentFruitType);
+    beepBuzzer(2);
+    return SaleRecord{};
   }
 
   SaleRecord sale = recordSale(source);
@@ -503,6 +546,14 @@ void updateLockedWeight() {
     if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
       resetWeightState();
       Serial.println("Object removed - zero display resumed");
+      return;
+    }
+
+    if (!cameraResultReceived &&
+        !cameraDetectionRequested &&
+        objectPresentStartedMs != 0 &&
+        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
+      requestFruitDetection();
     }
     return;
   }
@@ -515,6 +566,7 @@ void updateLockedWeight() {
     objectRemoveCount = 0;
     lockMatchCount = 0;
     lastLockCandidateGrams = 0.0;
+    objectPresentStartedMs = 0;
     return;
   }
 
@@ -526,8 +578,15 @@ void updateLockedWeight() {
     return;
   }
 
+  if (!objectPresent) {
+    objectPresentStartedMs = millis();
+    strlcpy(currentFruitType, "Settling", sizeof(currentFruitType));
+  }
   objectPresent = true;
-  requestFruitDetection();
+  if (!cameraResultReceived &&
+      millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
+    requestFruitDetection();
+  }
   objectRemoveCount = 0;
   currentWeightGrams = liveWeightGrams;
   if (liveWeightGrams == lastLockCandidateGrams) {
@@ -1001,7 +1060,11 @@ void updateDisplay() {
   snprintf(line, sizeof(line), "Fruit:%-13.13s", currentFruitType);
   printPadded(0, 0, line);
 
-  snprintf(line, sizeof(line), "Wt:%5.2fkg P:%6.2f", weightKg, price);
+  if (hasFruitPrice(currentFruitType)) {
+    snprintf(line, sizeof(line), "Wt:%5.2fkg P:%6.2f", weightKg, price);
+  } else {
+    snprintf(line, sizeof(line), "Wt:%5.2fkg P: --", weightKg);
+  }
   printPadded(0, 1, line);
 
   if (rtcReady) {

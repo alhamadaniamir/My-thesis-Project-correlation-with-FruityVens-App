@@ -21,8 +21,11 @@ constexpr int kLedPin = 13;
 constexpr int kInputSize = 96;
 constexpr size_t kTensorArenaSize = 1024 * 1024;
 constexpr float kDetectionThreshold = 0.60f;
-constexpr uint32_t kDetectionIntervalMs = 700;
-constexpr uint32_t kDetectionTimeoutMs = 6000;
+constexpr uint32_t kPlacementSettleMs = 1200;
+constexpr uint32_t kDetectionIntervalMs = 450;
+constexpr uint32_t kDetectionTimeoutMs = 12000;
+constexpr uint8_t kDetectionSampleFrames = 5;
+constexpr uint8_t kRequiredMatchingFrames = 3;
 constexpr uint32_t kPreviewIdleTimeoutMs = 20000;
 constexpr uint8_t kSnapshotJpegQuality = 80;
 
@@ -48,6 +51,13 @@ struct DetectionPacket {
   float confidence;
   uint32_t sequence;
   uint32_t uptime_ms;
+};
+
+struct DetectionVote {
+  char label[32];
+  uint8_t count;
+  float confidence_sum;
+  float best_confidence;
 };
 
 struct LabelMapEntry {
@@ -189,6 +199,8 @@ uint32_t command_sequence_id = 0;
 uint32_t last_detection_ms = 0;
 uint32_t detection_started_ms = 0;
 uint32_t last_preview_ms = 0;
+uint8_t detection_frames_seen = 0;
+DetectionVote detection_votes[kDetectionSampleFrames] = {};
 WebServer web_server(80);
 char latest_label[32] = "Idle";
 float latest_confidence = 0.0f;
@@ -251,6 +263,16 @@ void updateCameraOutput() {
   digitalWrite(kLedPin, cameraOutputActive() ? HIGH : LOW);
 }
 
+void resetDetectionVotes() {
+  detection_frames_seen = 0;
+  for (uint8_t i = 0; i < kDetectionSampleFrames; ++i) {
+    detection_votes[i].label[0] = '\0';
+    detection_votes[i].count = 0;
+    detection_votes[i].confidence_sum = 0.0f;
+    detection_votes[i].best_confidence = 0.0f;
+  }
+}
+
 void setDetectionActive(bool active, const char* reason) {
   if (detection_active == active) {
     return;
@@ -261,11 +283,13 @@ void setDetectionActive(bool active, const char* reason) {
   if (active) {
     detection_started_ms = millis();
     last_detection_ms = 0;
+    resetDetectionVotes();
     detection_result_sent = false;
     latest_confidence = 0.0f;
     latest_uptime_ms = millis();
-    strlcpy(latest_label, "Processing", sizeof(latest_label));
+    strlcpy(latest_label, "Settling", sizeof(latest_label));
   } else {
+    resetDetectionVotes();
     if (!detection_result_sent) {
       strlcpy(latest_label, "Idle", sizeof(latest_label));
       latest_confidence = 0.0f;
@@ -762,6 +786,61 @@ void findTopPrediction(int& best_index, float& best_probability) {
   best_probability = expf(dequantizeValue(output_tensor, best_index) - max_logit) / exp_sum;
 }
 
+void recordDetectionVote(const char* label, float confidence) {
+  detection_frames_seen++;
+  if (strcmp(label, "Unknown") == 0 || confidence < kDetectionThreshold) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < kDetectionSampleFrames; ++i) {
+    if (strcmp(detection_votes[i].label, label) == 0) {
+      detection_votes[i].count++;
+      detection_votes[i].confidence_sum += confidence;
+      if (confidence > detection_votes[i].best_confidence) {
+        detection_votes[i].best_confidence = confidence;
+      }
+      return;
+    }
+  }
+
+  for (uint8_t i = 0; i < kDetectionSampleFrames; ++i) {
+    if (detection_votes[i].count == 0) {
+      strlcpy(detection_votes[i].label, label, sizeof(detection_votes[i].label));
+      detection_votes[i].count = 1;
+      detection_votes[i].confidence_sum = confidence;
+      detection_votes[i].best_confidence = confidence;
+      return;
+    }
+  }
+}
+
+bool bestDetectionVote(char* label, size_t label_size, float& average_confidence, uint8_t& count) {
+  const DetectionVote* best_vote = nullptr;
+  for (uint8_t i = 0; i < kDetectionSampleFrames; ++i) {
+    if (detection_votes[i].count == 0) {
+      continue;
+    }
+    if (best_vote == nullptr ||
+        detection_votes[i].count > best_vote->count ||
+        (detection_votes[i].count == best_vote->count &&
+         detection_votes[i].best_confidence > best_vote->best_confidence)) {
+      best_vote = &detection_votes[i];
+    }
+  }
+
+  if (best_vote == nullptr) {
+    label[0] = '\0';
+    average_confidence = 0.0f;
+    count = 0;
+    return false;
+  }
+
+  strlcpy(label, best_vote->label, label_size);
+  average_confidence = best_vote->confidence_sum / best_vote->count;
+  count = best_vote->count;
+  return true;
+}
+
 void sendDetection(const char* label, float confidence) {
   DetectionPacket packet = {};
   packet.packetType = kPacketTypeDetectionResult;
@@ -844,6 +923,14 @@ void loop() {
     return;
   }
 
+  if (millis() - detection_started_ms < kPlacementSettleMs) {
+    strlcpy(latest_label, "Settling", sizeof(latest_label));
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+    delay(10);
+    return;
+  }
+
   if (last_detection_ms != 0 &&
       millis() - last_detection_ms < kDetectionIntervalMs) {
     delay(10);
@@ -879,7 +966,9 @@ void loop() {
   const char* raw_label = mapLabel(g_class_labels[best_index]);
   const char* predicted_label =
     best_probability >= kDetectionThreshold ? normalizeFruitName(raw_label) : "Unknown";
-  strlcpy(latest_label, predicted_label, sizeof(latest_label));
+  recordDetectionVote(predicted_label, best_probability);
+
+  strlcpy(latest_label, "Processing", sizeof(latest_label));
   latest_confidence = best_probability;
   latest_uptime_ms = millis();
 
@@ -888,9 +977,27 @@ void loop() {
   Serial.print(" raw=");
   Serial.print(raw_label);
   Serial.print(" | confidence=");
-  Serial.println(best_probability, 4);
+  Serial.print(best_probability, 4);
+  Serial.print(" | frame=");
+  Serial.print(detection_frames_seen);
+  Serial.print("/");
+  Serial.println(kDetectionSampleFrames);
 
-  if (best_probability >= kDetectionThreshold) {
-    sendDetection(predicted_label, best_probability);
+  char stable_label[32] = "";
+  float stable_confidence = 0.0f;
+  uint8_t stable_count = 0;
+  if (bestDetectionVote(stable_label, sizeof(stable_label), stable_confidence, stable_count) &&
+      stable_count >= kRequiredMatchingFrames) {
+    strlcpy(latest_label, stable_label, sizeof(latest_label));
+    latest_confidence = stable_confidence;
+    sendDetection(stable_label, stable_confidence);
+    return;
+  }
+
+  if (detection_frames_seen >= kDetectionSampleFrames) {
+    strlcpy(latest_label, "Unknown", sizeof(latest_label));
+    latest_confidence = 0.0f;
+    latest_uptime_ms = millis();
+    sendDetection("Unknown", 0.0f);
   }
 }
