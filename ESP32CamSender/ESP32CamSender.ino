@@ -26,6 +26,10 @@ constexpr uint32_t kDetectionIntervalMs = 450;
 constexpr uint32_t kDetectionTimeoutMs = 12000;
 constexpr uint8_t kDetectionSampleFrames = 10;
 constexpr uint8_t kRequiredMatchingFrames = 5;
+constexpr float kRoiX = 0.20f;
+constexpr float kRoiY = 0.15f;
+constexpr float kRoiW = 0.60f;
+constexpr float kRoiH = 0.70f;
 constexpr uint32_t kPreviewIdleTimeoutMs = 20000;
 constexpr uint8_t kSnapshotJpegQuality = 80;
 
@@ -715,14 +719,17 @@ bool initTflm() {
 void preprocessFrame(camera_fb_t* fb, TfLiteTensor* input) {
   const int src_w = fb->width;
   const int src_h = fb->height;
-  const int crop = min(src_w, src_h);
-  const int x_offset = (src_w - crop) / 2;
-  const int y_offset = (src_h - crop) / 2;
+  const int roi_w = max(1, min(src_w, static_cast<int>(src_w * kRoiW)));
+  const int roi_h = max(1, min(src_h, static_cast<int>(src_h * kRoiH)));
+  const int max_x_offset = max(0, src_w - roi_w);
+  const int max_y_offset = max(0, src_h - roi_h);
+  const int x_offset = max(0, min(max_x_offset, static_cast<int>(src_w * kRoiX)));
+  const int y_offset = max(0, min(max_y_offset, static_cast<int>(src_h * kRoiY)));
 
   for (int y = 0; y < kInputSize; ++y) {
-    int src_y = y_offset + (y * crop) / kInputSize;
+    int src_y = y_offset + (y * roi_h) / kInputSize;
     for (int x = 0; x < kInputSize; ++x) {
-      int src_x = x_offset + (x * crop) / kInputSize;
+      int src_x = x_offset + (x * roi_w) / kInputSize;
       int index = (src_y * src_w + src_x) * 2;
       uint16_t pixel = static_cast<uint16_t>(fb->buf[index]) |
                        (static_cast<uint16_t>(fb->buf[index + 1]) << 8);
