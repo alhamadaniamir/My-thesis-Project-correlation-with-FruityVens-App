@@ -26,10 +26,10 @@ constexpr uint32_t kDetectionIntervalMs = 450;
 constexpr uint32_t kDetectionTimeoutMs = 12000;
 constexpr uint8_t kDetectionSampleFrames = 10;
 constexpr uint8_t kRequiredMatchingFrames = 5;
-constexpr float kRoiX = 0.20f;
-constexpr float kRoiY = 0.15f;
-constexpr float kRoiW = 0.60f;
-constexpr float kRoiH = 0.70f;
+constexpr float kRoiX = 0.14f;
+constexpr float kRoiY = 0.07f;
+constexpr float kRoiW = 0.82f;
+constexpr float kRoiH = 0.80f;
 constexpr uint32_t kPreviewIdleTimeoutMs = 20000;
 constexpr uint8_t kSnapshotJpegQuality = 80;
 
