@@ -256,6 +256,20 @@ void printPadded(uint8_t col, uint8_t row, const char* text) {
   }
 }
 
+void formatDisplayWeight(float weightGrams, char* buffer, size_t bufferSize) {
+  if (weightGrams < 0.0f) {
+    weightGrams = 0.0f;
+  }
+
+  if (weightGrams < 1000.0f) {
+    snprintf(buffer, bufferSize, "%.0fg", weightGrams);
+    return;
+  }
+
+  const float weightKg = weightGrams / 1000.0f;
+  snprintf(buffer, bufferSize, "%.2fkg", weightKg);
+}
+
 bool hasFruitPrice(const char* fruitType) {
   if (fruitType == nullptr || strlen(fruitType) == 0) {
     return false;
@@ -1047,7 +1061,6 @@ void updateDisplay() {
   float billableWeightGrams = currentWeightGrams;
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = calculatePrice(billableWeightGrams);
-  float weightKg = billableWeightGrams / 1000.0;
   char statusCode = 'Z';
   if (weightLocked) {
     statusCode = 'L';
@@ -1056,14 +1069,16 @@ void updateDisplay() {
   }
 
   char line[21];
+  char weightText[9];
+  formatDisplayWeight(billableWeightGrams, weightText, sizeof(weightText));
 
   snprintf(line, sizeof(line), "Fruit:%-13.13s", currentFruitType);
   printPadded(0, 0, line);
 
   if (hasFruitPrice(currentFruitType)) {
-    snprintf(line, sizeof(line), "Wt:%5.2fkg P:%6.2f", weightKg, price);
+    snprintf(line, sizeof(line), "Wt:%-7s P:%6.2f", weightText, price);
   } else {
-    snprintf(line, sizeof(line), "Wt:%5.2fkg P: --", weightKg);
+    snprintf(line, sizeof(line), "Wt:%-7s P: --", weightText);
   }
   printPadded(0, 1, line);
 
