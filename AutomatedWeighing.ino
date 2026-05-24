@@ -43,6 +43,7 @@ const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
 const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
 const float CALIBRATION_STEP = 0.001;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
+const unsigned long SERIAL_DIAGNOSTIC_INTERVAL_MS = 500;
 const unsigned long BUTTON_DEBOUNCE_MS = 40;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
 const unsigned long MESSAGE_DISPLAY_MS = 1000;
@@ -161,6 +162,7 @@ ButtonState cancelButton = { BTN_CANCEL, false, false, false, false, 0 };
 float calibration_factor = DEFAULT_CALIBRATION_FACTOR;
 float currentWeightGrams = 0.0;
 unsigned long lastDisplayMs = 0;
+unsigned long lastSerialDiagnosticMs = 0;
 unsigned long lastHx711UpdateMs = 0;
 unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
@@ -168,6 +170,10 @@ unsigned long messageUntilMs = 0;
 float lastLockCandidateGrams = 0.0;
 float lockedWeightGrams = 0.0;
 float filteredWeightGrams = 0.0;
+float lastSensorWeightGrams = 0.0;
+float lastProcessedWeightGrams = 0.0;
+float lastReturnedWeightGrams = 0.0;
+float lastFilterAlpha = 0.0;
 bool hx711Ready = false;
 bool rtcReady = false;
 bool weightLocked = false;
@@ -376,6 +382,10 @@ void resetWeightState() {
   currentWeightGrams = 0.0;
   lastLockCandidateGrams = 0.0;
   filteredWeightGrams = 0.0;
+  lastSensorWeightGrams = 0.0;
+  lastProcessedWeightGrams = 0.0;
+  lastReturnedWeightGrams = 0.0;
+  lastFilterAlpha = 0.0;
   objectDetectCount = 0;
   objectRemoveCount = 0;
   lockMatchCount = 0;
@@ -408,6 +418,7 @@ void printScaleHelp() {
   Serial.println("  r = reset calibration factor");
   Serial.println("  c 500 = calibrate with known 500g weight");
   Serial.println("  fruit Mango = set fruit name sent with Firebase sale");
+  Serial.println("Serial Monitor: 115200 baud");
   Serial.println("Buttons: released=1, pressed=0");
 }
 
@@ -417,6 +428,7 @@ float readWeightGrams() {
   }
 
   float weight = LoadCell.getData();
+  lastSensorWeightGrams = weight;
   if (isnan(weight) || isinf(weight)) {
     Serial.println("Invalid HX711 reading");
     return currentWeightGrams;
@@ -424,22 +436,59 @@ float readWeightGrams() {
 
   weight = fabs(weight);
   if (weight < NOISE_FLOOR_GRAMS) weight = 0;
+  lastProcessedWeightGrams = weight;
 
   if (filteredWeightGrams == 0.0 && weight >= OBJECT_DETECT_GRAMS) {
     filteredWeightGrams = weight;
-    return round(filteredWeightGrams * 10.0) / 10.0;
+    lastFilterAlpha = 1.0;
+    lastReturnedWeightGrams = round(filteredWeightGrams * 10.0) / 10.0;
+    return lastReturnedWeightGrams;
   }
 
   float filterAlpha = WEIGHT_FILTER_ALPHA;
   if (fabs(weight - filteredWeightGrams) >= FAST_WEIGHT_DELTA_GRAMS) {
     filterAlpha = FAST_WEIGHT_FILTER_ALPHA;
   }
+  lastFilterAlpha = filterAlpha;
 
   filteredWeightGrams =
     (filterAlpha * weight) + ((1.0 - filterAlpha) * filteredWeightGrams);
   if (filteredWeightGrams < NOISE_FLOOR_GRAMS) filteredWeightGrams = 0;
 
-  return round(filteredWeightGrams * 10.0) / 10.0;
+  lastReturnedWeightGrams = round(filteredWeightGrams * 10.0) / 10.0;
+  return lastReturnedWeightGrams;
+}
+
+void printScaleDiagnostics() {
+  const unsigned long nowMs = millis();
+  Serial.print("SCALE status=");
+  Serial.print(scaleStatusText());
+  Serial.print(" sensor=");
+  Serial.print(lastSensorWeightGrams, 2);
+  Serial.print("g processed=");
+  Serial.print(lastProcessedWeightGrams, 2);
+  Serial.print("g filtered=");
+  Serial.print(filteredWeightGrams, 2);
+  Serial.print("g current=");
+  Serial.print(currentWeightGrams, 2);
+  Serial.print("g locked=");
+  Serial.print(lockedWeightGrams, 2);
+  Serial.print("g filter=");
+  Serial.print(lastFilterAlpha, 2);
+  Serial.print(" lock=");
+  Serial.print(static_cast<unsigned int>(lockMatchCount));
+  Serial.print("/");
+  Serial.print(static_cast<unsigned int>(LOCK_MATCH_SAMPLES));
+  Serial.print(" fruit=");
+  Serial.print(currentFruitType);
+  Serial.print(" cal=");
+  Serial.print(calibration_factor, 6);
+  Serial.print(" btnOK=");
+  Serial.print(digitalRead(BTN_SUCCESS));
+  Serial.print(" btnCancel=");
+  Serial.print(digitalRead(BTN_CANCEL));
+  Serial.print(" hxAgeMs=");
+  Serial.println(nowMs - lastHx711UpdateMs);
 }
 
 void showMessage(const char* line1, const char* line2 = "", unsigned long nowMs = millis()) {
@@ -1520,7 +1569,7 @@ void processSerialCommand() {
 }
 
 void setup() {
-  Serial.begin(57600);
+  Serial.begin(115200);
   Serial.setTimeout(50);
 
   pinMode(BTN_SUCCESS, INPUT_PULLUP);
@@ -1575,23 +1624,15 @@ void loop() {
     uploadPendingSales();
   }
 
-  if (millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
-    if (objectPresent || weightLocked) {
-      Serial.print("Weight(g): ");
-      Serial.println(currentWeightGrams, 2);
-    } else {
-      Serial.println("Weight(g): 0.00");
-    }
-    Serial.print("Calibration factor: ");
-    Serial.println(calibration_factor, 6);
+  if (millis() - lastSerialDiagnosticMs >= SERIAL_DIAGNOSTIC_INTERVAL_MS) {
+    printScaleDiagnostics();
     if (hx711Ready && millis() - lastHx711UpdateMs > 2000) {
       Serial.println("HX711 not updating - check DOUT/SCK wiring and power.");
     }
-    Serial.print("Buttons raw SUCCESS=");
-    Serial.print(digitalRead(BTN_SUCCESS));
-    Serial.print(" CANCEL=");
-    Serial.println(digitalRead(BTN_CANCEL));
+    lastSerialDiagnosticMs = millis();
+  }
 
+  if (millis() - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
     if (millis() >= messageUntilMs) {
       updateDisplay();
     }
