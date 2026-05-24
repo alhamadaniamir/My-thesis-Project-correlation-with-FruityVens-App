@@ -191,6 +191,7 @@ uint32_t cameraCommandSequence = 0;
 bool espNowReady = false;
 bool cameraDetectionRequested = false;
 bool cameraResultReceived = false;
+bool saleConfirmedForCurrentObject = false;
 
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
@@ -368,6 +369,7 @@ void resetWeightState() {
   stopFruitDetection(true);
   weightLocked = false;
   objectPresent = false;
+  saleConfirmedForCurrentObject = false;
   lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
   lastLockCandidateGrams = 0.0;
@@ -485,18 +487,18 @@ SaleRecord confirmSale(const char* reason, const char* source) {
       strcmp(currentFruitType, "Settling") == 0 ||
       !cameraResultReceived) {
     showMessage("Detecting fruit", "Please wait");
-    if (objectPresentStartedMs != 0 &&
-        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
-      requestFruitDetection();
-    }
     beepBuzzer(2);
     return SaleRecord{};
   }
 
   if (strcmp(currentFruitType, "Unknown") == 0) {
-    cameraResultReceived = false;
-    requestFruitDetection();
-    showMessage("Check fruit", "Retrying scan");
+    showMessage("Check fruit", "No sale saved");
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
+  if (saleConfirmedForCurrentObject) {
+    showMessage("Already saved", "Remove item");
     beepBuzzer(2);
     return SaleRecord{};
   }
@@ -532,6 +534,7 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   } else {
     showMessage("Saved for sync", line2);
   }
+  saleConfirmedForCurrentObject = true;
   stopFruitDetection(false);
   beepBuzzer(1);
   return sale;
@@ -575,6 +578,7 @@ void updateLockedWeight() {
   if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
     stopFruitDetection(true);
     objectPresent = false;
+    saleConfirmedForCurrentObject = false;
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
     objectRemoveCount = 0;
@@ -857,7 +861,9 @@ void stopFruitDetection(bool clearFruit) {
     sendCameraCommand("STOP");
   }
   cameraDetectionRequested = false;
-  cameraResultReceived = false;
+  if (clearFruit) {
+    cameraResultReceived = false;
+  }
   lastCameraCommandMs = 0;
   cameraDetectionStartedMs = 0;
   if (clearFruit) {

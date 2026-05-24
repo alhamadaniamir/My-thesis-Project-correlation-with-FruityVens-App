@@ -26,6 +26,7 @@ constexpr uint32_t kDetectionIntervalMs = 450;
 constexpr uint32_t kDetectionTimeoutMs = 12000;
 constexpr uint8_t kDetectionSampleFrames = 10;
 constexpr uint8_t kRequiredMatchingFrames = 5;
+constexpr uint8_t kFallbackMatchingFrames = 2;
 constexpr float kRoiX = 0.14f;
 constexpr float kRoiY = 0.07f;
 constexpr float kRoiW = 0.82f;
@@ -214,8 +215,14 @@ uint8_t detection_frames_seen = 0;
 DetectionVote detection_votes[kDetectionSampleFrames] = {};
 WebServer web_server(80);
 char latest_label[32] = "Idle";
+char latest_raw_label[32] = "";
+char latest_normalized_label[32] = "";
+char latest_candidate_label[32] = "";
+char latest_monitor_line[160] = "Waiting for scale detection...";
 float latest_confidence = 0.0f;
 uint32_t latest_uptime_ms = 0;
+uint8_t latest_frame_seen = 0;
+bool latest_blocked = false;
 bool detection_active = false;
 bool detection_result_sent = false;
 bool preview_active = false;
@@ -264,6 +271,24 @@ const char* normalizeFruitName(const char* label) {
   if (labelStartsWith(label, "Strawberry")) return "Strawberries";
   if (labelStartsWith(label, "Watermelon")) return "Watermelon";
   return label;
+}
+
+bool isAllowedFruitName(const char* label) {
+  return strcmp(label, "Apple") == 0 ||
+         strcmp(label, "Avocado") == 0 ||
+         strcmp(label, "Banana") == 0 ||
+         strcmp(label, "Grapes") == 0 ||
+         strcmp(label, "Guava") == 0 ||
+         strcmp(label, "Lemon") == 0 ||
+         strcmp(label, "Mango") == 0 ||
+         strcmp(label, "Orange") == 0 ||
+         strcmp(label, "Papaya") == 0 ||
+         strcmp(label, "Pear") == 0 ||
+         strcmp(label, "Pineapple") == 0 ||
+         strcmp(label, "Pomelo") == 0 ||
+         strcmp(label, "Rambutan") == 0 ||
+         strcmp(label, "Strawberries") == 0 ||
+         strcmp(label, "Watermelon") == 0;
 }
 
 RoiRect computeRoiRect(int src_w, int src_h) {
@@ -315,6 +340,32 @@ bool cameraOutputActive() {
   return detection_active || preview_active;
 }
 
+void resetLatestDetectionInfo(const char* monitor_line) {
+  latest_raw_label[0] = '\0';
+  latest_normalized_label[0] = '\0';
+  latest_candidate_label[0] = '\0';
+  latest_frame_seen = 0;
+  latest_blocked = false;
+  strlcpy(latest_monitor_line, monitor_line, sizeof(latest_monitor_line));
+}
+
+void appendJsonString(String& json, const char* value) {
+  json += "\"";
+  for (const char* cursor = value; *cursor != '\0'; ++cursor) {
+    if (*cursor == '"' || *cursor == '\\') {
+      json += '\\';
+      json += *cursor;
+    } else if (*cursor == '\n') {
+      json += "\\n";
+    } else if (*cursor == '\r') {
+      json += "\\r";
+    } else {
+      json += *cursor;
+    }
+  }
+  json += "\"";
+}
+
 void updateCameraOutput() {
   digitalWrite(kLedPin, cameraOutputActive() ? HIGH : LOW);
 }
@@ -344,12 +395,14 @@ void setDetectionActive(bool active, const char* reason) {
     latest_confidence = 0.0f;
     latest_uptime_ms = millis();
     strlcpy(latest_label, "Settling", sizeof(latest_label));
+    resetLatestDetectionInfo("Detection started: waiting for fruit to settle");
   } else {
     resetDetectionVotes();
     if (!detection_result_sent) {
       strlcpy(latest_label, "Idle", sizeof(latest_label));
       latest_confidence = 0.0f;
       latest_uptime_ms = millis();
+      resetLatestDetectionInfo("Detection stopped");
     }
   }
 
@@ -372,10 +425,12 @@ void setPreviewActive(bool active, const char* reason) {
     strlcpy(latest_label, "Preview", sizeof(latest_label));
     latest_confidence = 0.0f;
     latest_uptime_ms = millis();
+    resetLatestDetectionInfo("Preview on: camera frame visible");
   } else if (!cameraOutputActive() && !detection_result_sent) {
     strlcpy(latest_label, "Idle", sizeof(latest_label));
     latest_confidence = 0.0f;
     latest_uptime_ms = millis();
+    resetLatestDetectionInfo("Preview off");
   }
 
   Serial.print(active ? "Preview ON: " : "Preview OFF: ");
@@ -551,10 +606,16 @@ void startWebServer() {
     img{display:none;width:100%;max-width:520px;background:#000;border:1px solid #3f5566;border-radius:8px;}
     button{font-size:18px;padding:12px 18px;margin:6px;border:0;border-radius:8px;color:white;}
     .on{background:#2e7d32;}.off{background:#b71c1c;}.test{background:#1565c0;}
+    .controls{margin-top:10px;}
     .panel{background:#1d2a35;border-radius:10px;padding:16px;}
     .fruit{font-size:34px;font-weight:700;margin:12px 0;word-break:break-word;}
     .confidence{font-size:18px;color:#8ee59b;margin-bottom:8px;}
     .meta,.idle{color:#b8c1cc;font-size:14px;line-height:1.4;}
+    .monitor{margin-top:14px;background:#0b1117;border:1px solid #31475a;border-radius:8px;padding:12px;text-align:left;}
+    .monitor-title{color:#8ee59b;font-size:13px;font-weight:700;margin-bottom:8px;text-transform:uppercase;}
+    .monitor-line{color:#eef6ff;font-family:Consolas,Monaco,monospace;font-size:13px;line-height:1.45;min-height:38px;white-space:pre-wrap;word-break:break-word;margin:0 0 10px;}
+    .monitor-grid{display:grid;grid-template-columns:92px 1fr;gap:5px 10px;color:#b8c1cc;font-size:13px;}
+    .monitor-grid b{color:white;font-weight:600;}
   </style>
 </head>
 <body>
@@ -566,13 +627,29 @@ void startWebServer() {
       <div class="fruit" id="label">Idle</div>
       <div class="confidence" id="confidence">0% confidence</div>
       <div class="meta" id="meta">Waiting for scale detection...</div>
-      <button class="on" onclick="fetch('/preview/start')">Preview ON</button>
-      <button class="off" onclick="fetch('/preview/stop')">Preview OFF</button>
-      <button class="test" onclick="fetch('/detect/start')">Detect Test</button>
-      <button class="off" onclick="fetch('/detect/stop')">Stop</button>
+      <div class="controls">
+        <button class="on" onclick="cmd('/preview/start')">Preview ON</button>
+        <button class="off" onclick="cmd('/preview/stop')">Preview OFF</button>
+        <button class="test" onclick="cmd('/detect/start')">Detect Test</button>
+        <button class="off" onclick="cmd('/detect/stop')">Stop</button>
+      </div>
+      <div class="monitor">
+        <div class="monitor-title">Mini monitor</div>
+        <pre class="monitor-line" id="monitorLine">Waiting for scale detection...</pre>
+        <div class="monitor-grid">
+          <span>Frames</span><b id="monitorFrames">0/10</b>
+          <span>Raw</span><b id="monitorRaw">-</b>
+          <span>Accepted</span><b id="monitorAccepted">-</b>
+          <span>Blocked</span><b id="monitorBlocked">No</b>
+        </div>
+      </div>
     </div>
   </main>
   <script>
+    async function cmd(path){
+      try{await fetch(path+'?ts='+Date.now());}catch(e){}
+      refresh();
+    }
     async function refresh(){
       try{
         const r=await fetch('/status?ts='+Date.now());
@@ -583,6 +660,11 @@ void startWebServer() {
         document.getElementById('label').textContent=s.label;
         document.getElementById('confidence').textContent=Math.round(s.confidence*100)+'% confidence';
         document.getElementById('meta').textContent=(s.active?'Detecting':'Idle')+' | Preview '+(s.preview?'ON':'OFF')+' | LED '+(s.led?'ON':'OFF')+' | IP '+s.ip;
+        document.getElementById('monitorLine').textContent=s.monitor;
+        document.getElementById('monitorFrames').textContent=s.frames_seen+'/'+s.sample_frames+' frames, need '+s.required_frames+', final accepts '+s.fallback_frames;
+        document.getElementById('monitorRaw').textContent=s.raw || '-';
+        document.getElementById('monitorAccepted').textContent=s.candidate || '-';
+        document.getElementById('monitorBlocked').textContent=s.blocked?'Yes':'No';
         img.style.display=cameraOn?'block':'none';
         idle.style.display=cameraOn?'none':'block';
         if(cameraOn){img.src='/snapshot.jpg?ts='+Date.now();}
@@ -602,10 +684,28 @@ void startWebServer() {
 
   web_server.on("/status", []() {
     String json = "{";
-    json += "\"label\":\"";
-    json += latest_label;
-    json += "\",\"confidence\":";
+    json += "\"label\":";
+    appendJsonString(json, latest_label);
+    json += ",\"confidence\":";
     json += String(latest_confidence, 4);
+    json += ",\"raw\":";
+    appendJsonString(json, latest_raw_label);
+    json += ",\"normalized\":";
+    appendJsonString(json, latest_normalized_label);
+    json += ",\"candidate\":";
+    appendJsonString(json, latest_candidate_label);
+    json += ",\"monitor\":";
+    appendJsonString(json, latest_monitor_line);
+    json += ",\"frames_seen\":";
+    json += String(static_cast<unsigned int>(latest_frame_seen));
+    json += ",\"sample_frames\":";
+    json += String(static_cast<unsigned int>(kDetectionSampleFrames));
+    json += ",\"required_frames\":";
+    json += String(static_cast<unsigned int>(kRequiredMatchingFrames));
+    json += ",\"fallback_frames\":";
+    json += String(static_cast<unsigned int>(kFallbackMatchingFrames));
+    json += ",\"blocked\":";
+    json += latest_blocked ? "true" : "false";
     json += ",\"sequence\":";
     json += String(sequence_id);
     json += ",\"uptime_ms\":";
@@ -618,9 +718,8 @@ void startWebServer() {
     json += cameraOutputActive() ? "true" : "false";
     json += ",\"led\":";
     json += digitalRead(kLedPin) == HIGH ? "true" : "false";
-    json += ",\"ip\":\"";
-    json += WiFi.localIP().toString();
-    json += "\"";
+    json += ",\"ip\":";
+    appendJsonString(json, WiFi.localIP().toString().c_str());
     json += "}";
     web_server.send(200, "application/json", json);
   });
@@ -912,6 +1011,19 @@ void sendDetection(const char* label, float confidence) {
   packet.sequence = ++sequence_id;
   packet.uptime_ms = millis();
 
+  strlcpy(latest_candidate_label, label, sizeof(latest_candidate_label));
+  if (strcmp(label, "Unknown") != 0) {
+    latest_blocked = false;
+  }
+  snprintf(
+    latest_monitor_line,
+    sizeof(latest_monitor_line),
+    "Sent: %s | confidence=%.4f | sequence=%lu",
+    packet.label,
+    packet.confidence,
+    static_cast<unsigned long>(packet.sequence)
+  );
+
   Serial.print("Sending: ");
   Serial.print(packet.label);
   Serial.print(" | confidence=");
@@ -1009,6 +1121,7 @@ void loop() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (fb == nullptr) {
     Serial.println("Camera capture failed");
+    strlcpy(latest_monitor_line, "Camera capture failed", sizeof(latest_monitor_line));
     delay(250);
     return;
   }
@@ -1018,6 +1131,7 @@ void loop() {
 
   if (interpreter->Invoke() != kTfLiteOk) {
     Serial.println("Inference failed");
+    strlcpy(latest_monitor_line, "Inference failed", sizeof(latest_monitor_line));
     delay(250);
     return;
   }
@@ -1027,17 +1141,42 @@ void loop() {
   findTopPrediction(best_index, best_probability);
 
   const char* raw_label = mapLabel(g_class_labels[best_index]);
-  const char* predicted_label = normalizeFruitName(raw_label);
+  const char* normalized_label = normalizeFruitName(raw_label);
+  const char* predicted_label = isAllowedFruitName(normalized_label) ? normalized_label : "Unknown";
+  const bool blocked_label = strcmp(predicted_label, "Unknown") == 0 &&
+                             strcmp(normalized_label, "Unknown") != 0;
   recordDetectionVote(predicted_label, best_probability);
+  strlcpy(latest_raw_label, raw_label, sizeof(latest_raw_label));
+  strlcpy(latest_normalized_label, normalized_label, sizeof(latest_normalized_label));
+  strlcpy(latest_candidate_label, predicted_label, sizeof(latest_candidate_label));
+  latest_frame_seen = detection_frames_seen;
+  latest_blocked = blocked_label;
 
   strlcpy(latest_label, "Processing", sizeof(latest_label));
   latest_confidence = best_probability;
   latest_uptime_ms = millis();
 
+  snprintf(
+    latest_monitor_line,
+    sizeof(latest_monitor_line),
+    "Detected: %s raw=%s%s%s | confidence=%.4f | frame=%u/%u",
+    predicted_label,
+    raw_label,
+    blocked_label ? " blocked=" : "",
+    blocked_label ? normalized_label : "",
+    best_probability,
+    static_cast<unsigned int>(latest_frame_seen),
+    static_cast<unsigned int>(kDetectionSampleFrames)
+  );
+
   Serial.print("Detected: ");
   Serial.print(predicted_label);
   Serial.print(" raw=");
   Serial.print(raw_label);
+  if (blocked_label) {
+    Serial.print(" blocked=");
+    Serial.print(normalized_label);
+  }
   Serial.print(" | confidence=");
   Serial.print(best_probability, 4);
   Serial.print(" | frame=");
@@ -1057,6 +1196,14 @@ void loop() {
   }
 
   if (detection_frames_seen >= kDetectionSampleFrames) {
+    if (stable_count >= kFallbackMatchingFrames) {
+      strlcpy(latest_label, stable_label, sizeof(latest_label));
+      latest_confidence = stable_confidence;
+      latest_blocked = false;
+      sendDetection(stable_label, stable_confidence);
+      return;
+    }
+
     strlcpy(latest_label, "Unknown", sizeof(latest_label));
     latest_confidence = 0.0f;
     latest_uptime_ms = millis();
