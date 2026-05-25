@@ -23,8 +23,8 @@
 #define BTN_CANCEL 14
 #define BUZZER_PIN 26
 
-const char* ssid = "Parafiber_F0C0 2.4G";
-const char* password = "C0E277DF";
+const char* ssid = "Aida_iPhone";
+const char* password = "1234567899";
 
 const char* firebaseDatabaseUrl = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* firebaseScaleDeviceId = "fruityvens-scale-01";
@@ -53,6 +53,8 @@ const unsigned long PRICE_UPDATE_POLL_MS = 5000;
 const unsigned long PRICE_TABLE_REFRESH_MS = 60000;
 const unsigned long FIREBASE_HTTP_TIMEOUT_MS = 1500;
 const unsigned long FIREBASE_RETRY_MS = 5000;
+const unsigned long FIREBASE_READ_FAILURE_BACKOFF_MS = 60000;
+const unsigned long FIREBASE_UPLOAD_FAILURE_BACKOFF_MS = 15000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 const float OBJECT_DETECT_GRAMS = 5.0;
@@ -193,6 +195,8 @@ char currentFruitType[32] = "Unknown";
 unsigned long lastFirebaseRetryMs = 0;
 unsigned long lastPriceUpdatePollMs = 0;
 unsigned long lastPriceTableRefreshMs = 0;
+unsigned long firebaseReadBackoffUntilMs = 0;
+unsigned long firebaseUploadBackoffUntilMs = 0;
 String lastPriceUpdateVersion = "";
 unsigned long objectPresentStartedMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
@@ -209,6 +213,7 @@ String saleRecordJson(const SaleRecord& sale, const String& indent);
 String firebaseSafeKey(const char* value);
 String firebaseSafeKey(const String& value);
 bool uploadPendingSales();
+bool maintainPendingSaleUpload();
 bool setupEspNow();
 void requestFruitDetection();
 void stopFruitDetection(bool clearFruit);
@@ -593,7 +598,7 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   char line2[21];
   snprintf(line2, sizeof(line2), "PHP %.2f", sale.price);
   showMessage("Sale confirmed", line2);
-  lastFirebaseRetryMs = millis();
+  lastFirebaseRetryMs = millis() - FIREBASE_RETRY_MS;
   saleConfirmedForCurrentObject = true;
   stopFruitDetection(false);
   beepBuzzer(1);
@@ -1307,6 +1312,42 @@ bool extractJsonNumber(const String& json, const char* key, String& value, int s
   return true;
 }
 
+bool firebaseReadBackoffActive() {
+  return firebaseReadBackoffUntilMs != 0 &&
+         static_cast<long>(firebaseReadBackoffUntilMs - millis()) > 0;
+}
+
+bool firebaseUploadBackoffActive() {
+  return firebaseUploadBackoffUntilMs != 0 &&
+         static_cast<long>(firebaseUploadBackoffUntilMs - millis()) > 0;
+}
+
+void noteFirebaseReadFailure(int statusCode = 0) {
+  firebaseReadBackoffUntilMs = millis() + FIREBASE_READ_FAILURE_BACKOFF_MS;
+  Serial.print("Firebase ");
+  Serial.print("read");
+  Serial.print(" paused ");
+  Serial.print(FIREBASE_READ_FAILURE_BACKOFF_MS / 1000);
+  Serial.print("s");
+  if (statusCode != 0) {
+    Serial.print(" after HTTP ");
+    Serial.print(statusCode);
+  }
+  Serial.println();
+}
+
+void noteFirebaseUploadFailure(int statusCode = 0) {
+  firebaseUploadBackoffUntilMs = millis() + FIREBASE_UPLOAD_FAILURE_BACKOFF_MS;
+  Serial.print("Firebase upload paused ");
+  Serial.print(FIREBASE_UPLOAD_FAILURE_BACKOFF_MS / 1000);
+  Serial.print("s");
+  if (statusCode != 0) {
+    Serial.print(" after HTTP ");
+    Serial.print(statusCode);
+  }
+  Serial.println();
+}
+
 bool getFirebaseJson(const String& path, String& payload) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
@@ -1320,6 +1361,7 @@ bool getFirebaseJson(const String& path, String& payload) {
   const String url = firebaseUrlForPath(path);
   if (!http.begin(client, url)) {
     Serial.println("Firebase read failed: could not start HTTPS request");
+    noteFirebaseReadFailure();
     return false;
   }
 
@@ -1328,10 +1370,7 @@ bool getFirebaseJson(const String& path, String& payload) {
   http.end();
 
   if (statusCode < 200 || statusCode >= 300) {
-    Serial.print("Firebase read HTTP ");
-    Serial.print(statusCode);
-    Serial.print(": ");
-    Serial.println(payload);
+    noteFirebaseReadFailure(statusCode);
     return false;
   }
 
@@ -1432,12 +1471,18 @@ void maintainPriceUpdates() {
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
+  if (firebaseReadBackoffActive()) {
+    return;
+  }
 
   const unsigned long now = millis();
   if (lastPriceTableRefreshMs == 0 ||
       now - lastPriceTableRefreshMs >= PRICE_TABLE_REFRESH_MS) {
     lastPriceTableRefreshMs = now;
     fetchPriceTable();
+    if (firebaseReadBackoffActive()) {
+      return;
+    }
   }
 
   if (now - lastPriceUpdatePollMs >= PRICE_UPDATE_POLL_MS) {
@@ -1460,6 +1505,7 @@ bool uploadSaleToFirebase(const SaleRecord& sale) {
   const String url = firebaseRequestUrl(sale);
   if (!http.begin(client, url)) {
     Serial.println("Firebase upload failed: could not start HTTPS request");
+    noteFirebaseUploadFailure();
     return false;
   }
 
@@ -1470,8 +1516,13 @@ bool uploadSaleToFirebase(const SaleRecord& sale) {
 
   Serial.print("Firebase upload HTTP ");
   Serial.print(statusCode);
-  Serial.print(": ");
-  Serial.println(response);
+  if (statusCode >= 200 && statusCode < 300) {
+    Serial.print(": ");
+    Serial.println(response);
+  } else {
+    Serial.println();
+    noteFirebaseUploadFailure(statusCode);
+  }
 
   return statusCode >= 200 && statusCode < 300;
 }
@@ -1480,31 +1531,38 @@ bool uploadPendingSales() {
   if (saleHistoryCount == 0) {
     return true;
   }
-
-  size_t kept = 0;
-  size_t uploaded = 0;
-  for (size_t i = 0; i < saleHistoryCount; i++) {
-    if (saleHistory[i].id != 0 && uploadSaleToFirebase(saleHistory[i])) {
-      uploaded++;
-      continue;
-    }
-    if (kept != i) {
-      saleHistory[kept] = saleHistory[i];
-    }
-    kept++;
+  if (firebaseUploadBackoffActive()) {
+    return false;
   }
 
-  for (size_t i = kept; i < saleHistoryCount; i++) {
-    saleHistory[i] = SaleRecord{};
+  if (saleHistory[0].id != 0 && !uploadSaleToFirebase(saleHistory[0])) {
+    Serial.print("Firebase pending sales remaining: ");
+    Serial.println(saleHistoryCount);
+    return false;
   }
-  saleHistoryCount = kept;
 
-  Serial.print("Firebase pending sales uploaded: ");
-  Serial.print(uploaded);
-  Serial.print(", remaining: ");
+  for (size_t i = 1; i < saleHistoryCount; i++) {
+    saleHistory[i - 1] = saleHistory[i];
+  }
+  saleHistoryCount--;
+  saleHistory[saleHistoryCount] = SaleRecord{};
+
+  Serial.print("Firebase pending sales uploaded: 1, remaining: ");
   Serial.println(saleHistoryCount);
 
   return saleHistoryCount == 0;
+}
+
+bool maintainPendingSaleUpload() {
+  if (WiFi.status() != WL_CONNECTED ||
+      saleHistoryCount == 0 ||
+      firebaseUploadBackoffActive() ||
+      millis() - lastFirebaseRetryMs < FIREBASE_RETRY_MS) {
+    return saleHistoryCount == 0;
+  }
+
+  lastFirebaseRetryMs = millis();
+  return uploadPendingSales();
 }
 
 void setCurrentFruitType(const String& fruit) {
@@ -1643,13 +1701,7 @@ void loop() {
   processSerialCommand();
   maintainFruitDetection();
   maintainPriceUpdates();
-
-  if (WiFi.status() == WL_CONNECTED &&
-      saleHistoryCount > 0 &&
-      millis() - lastFirebaseRetryMs >= FIREBASE_RETRY_MS) {
-    lastFirebaseRetryMs = millis();
-    uploadPendingSales();
-  }
+  maintainPendingSaleUpload();
 
   if (millis() - lastSerialDiagnosticMs >= SERIAL_DIAGNOSTIC_INTERVAL_MS) {
     printScaleDiagnostics();

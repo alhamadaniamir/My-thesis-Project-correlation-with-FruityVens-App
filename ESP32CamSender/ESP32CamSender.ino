@@ -15,8 +15,8 @@
 namespace {
 
 constexpr char kDeviceName[] = "ESP32-CAM";
-constexpr char kWifiSsid[] = "Parafiber_F0C0 2.4G";
-constexpr char kWifiPassword[] = "C0E277DF";
+constexpr char kWifiSsid[] = "Aida_iPhone";
+constexpr char kWifiPassword[] = "1234567899";
 constexpr int kLedPin = 13;
 constexpr int kInputSize = 96;
 constexpr size_t kTensorArenaSize = 1024 * 1024;
