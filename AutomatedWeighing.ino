@@ -769,7 +769,7 @@ void setupWifi() {
   lcd.clear();
   lcd.print("Connecting WiFi...");
   lcd.setCursor(0, 1);
-  lcd.print(ssid);
+  lcd.print("Please wait");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -784,22 +784,16 @@ void setupWifi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi OK");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("WiFi connected");
     lcd.clear();
     lcd.print("WiFi connected");
-    lcd.setCursor(0, 1);
-    lcd.print(WiFi.localIP().toString());
   } else {
-    Serial.println("WiFi FAILED");
+    Serial.println("WiFi not connected");
     WiFi.disconnect(false, false);
     lcd.clear();
-    lcd.print("WiFi failed");
+    lcd.print("WiFi not connected");
     lcd.setCursor(0, 1);
-    lcd.print("Check SSID/pass");
-    lcd.setCursor(0, 2);
-    lcd.print("Offline sync queue");
+    lcd.print("Offline mode");
   }
   delay(WIFI_RESULT_DISPLAY_MS);
 }
