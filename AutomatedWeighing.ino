@@ -29,6 +29,7 @@ const char* password = "1234567899";
 const char* firebaseDatabaseUrl = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* firebaseScaleDeviceId = "fruityvens-scale-01";
 const char* firebaseAuthToken = "";
+const bool useFirebaseWorkerEsp32 = true;
 
 const char* ntpServer = "time.google.com";
 const long gmtOffset_sec = 8 * 3600;
@@ -53,6 +54,7 @@ const unsigned long PRICE_UPDATE_POLL_MS = 5000;
 const unsigned long PRICE_TABLE_REFRESH_MS = 60000;
 const unsigned long FIREBASE_HTTP_TIMEOUT_MS = 1500;
 const unsigned long FIREBASE_RETRY_MS = 5000;
+const unsigned long WORKER_SALE_RETRY_MS = 1000;
 const unsigned long FIREBASE_READ_FAILURE_BACKOFF_MS = 60000;
 const unsigned long FIREBASE_UPLOAD_FAILURE_BACKOFF_MS = 15000;
 const unsigned int BUZZER_BEEP_MS = 220;
@@ -73,6 +75,9 @@ const unsigned long CAMERA_START_DELAY_MS = 1000;
 const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 12000;
 const uint8_t PACKET_TYPE_SCALE_COMMAND = 1;
 const uint8_t PACKET_TYPE_DETECTION_RESULT = 2;
+const uint8_t PACKET_TYPE_SALE_SYNC = 3;
+const uint8_t PACKET_TYPE_PRICE_UPDATE = 4;
+const uint8_t PACKET_TYPE_SALE_ACK = 5;
 
 uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -89,6 +94,36 @@ struct DetectionPacket {
   float confidence;
   uint32_t sequence;
   uint32_t uptime_ms;
+};
+
+struct SaleSyncPacket {
+  uint8_t packetType;
+  uint32_t sequence;
+  uint32_t saleId;
+  uint32_t createdAtMs;
+  float weightGrams;
+  float price;
+  float pricePerKg;
+  char fruitType[32];
+  char timestamp[25];
+  char date[11];
+  char time[9];
+  char source[16];
+  char firebaseKey[80];
+};
+
+struct PriceUpdatePacket {
+  uint8_t packetType;
+  uint32_t sequence;
+  float pricePerKg;
+  char fruitType[32];
+};
+
+struct SaleAckPacket {
+  uint8_t packetType;
+  uint32_t sequence;
+  bool accepted;
+  char firebaseKey[80];
 };
 
 struct FruitPrice {
@@ -201,6 +236,7 @@ String lastPriceUpdateVersion = "";
 unsigned long objectPresentStartedMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
 uint32_t cameraCommandSequence = 0;
+uint32_t saleSyncSequence = 0;
 bool espNowReady = false;
 bool cameraDetectionRequested = false;
 bool cameraResultReceived = false;
@@ -214,6 +250,7 @@ String firebaseSafeKey(const char* value);
 String firebaseSafeKey(const String& value);
 bool uploadPendingSales();
 bool maintainPendingSaleUpload();
+bool sendSaleToFirebaseWorker(const SaleRecord& sale);
 bool setupEspNow();
 void requestFruitDetection();
 void stopFruitDetection(bool clearFruit);
@@ -232,6 +269,38 @@ float calculatePrice(float weightGrams) {
 float calculatePriceForFruit(const char* fruitType, float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
   return (weightGrams / 1000.0) * pricePerKgForFruit(fruitType);
+}
+
+const char* canonicalFruitType(const char* fruitType) {
+  if (fruitType == nullptr || strlen(fruitType) == 0) {
+    return "";
+  }
+
+  if (strcmp(fruitType, "Grape") == 0 ||
+      strcmp(fruitType, "Grape Blue") == 0 ||
+      strcmp(fruitType, "Grape Pink") == 0 ||
+      strcmp(fruitType, "Grape White") == 0) {
+    return "Grapes";
+  }
+  if (strcmp(fruitType, "Strawberry") == 0) {
+    return "Strawberries";
+  }
+  if (strcmp(fruitType, "Mango Carabao") == 0 ||
+      strcmp(fruitType, "Indian Mango") == 0 ||
+      strcmp(fruitType, "Mango Red") == 0) {
+    return "Mango";
+  }
+  if (strcmp(fruitType, "Lime") == 0 || strcmp(fruitType, "Limes") == 0) {
+    return "Lemon";
+  }
+  if (strcmp(fruitType, "Mandarine") == 0) {
+    return "Orange";
+  }
+  if (strcmp(fruitType, "Pomelo Sweetie") == 0) {
+    return "Pomelo";
+  }
+
+  return fruitType;
 }
 
 const char* scaleStatusText() {
@@ -287,12 +356,13 @@ void formatDisplayWeight(float weightGrams, char* buffer, size_t bufferSize) {
 }
 
 bool hasFruitPrice(const char* fruitType) {
-  if (fruitType == nullptr || strlen(fruitType) == 0) {
+  const char* canonicalFruit = canonicalFruitType(fruitType);
+  if (strlen(canonicalFruit) == 0) {
     return false;
   }
 
   for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0 &&
+    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0 &&
         fruitPrices[i].pricePerKg > 0.0f) {
       return true;
     }
@@ -301,12 +371,13 @@ bool hasFruitPrice(const char* fruitType) {
 }
 
 float pricePerKgForFruit(const char* fruitType) {
-  if (fruitType == nullptr || strlen(fruitType) == 0) {
+  const char* canonicalFruit = canonicalFruitType(fruitType);
+  if (strlen(canonicalFruit) == 0) {
     return 0.0f;
   }
 
   for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0) {
+    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0) {
       return fruitPrices[i].pricePerKg;
     }
   }
@@ -314,15 +385,20 @@ float pricePerKgForFruit(const char* fruitType) {
 }
 
 bool setFruitPrice(const char* fruitType, float pricePerKg) {
-  if (fruitType == nullptr || strlen(fruitType) == 0 || pricePerKg <= 0.0f) {
+  const char* canonicalFruit = canonicalFruitType(fruitType);
+  if (strlen(canonicalFruit) == 0 || pricePerKg <= 0.0f) {
     return false;
   }
 
   for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, fruitType) == 0) {
+    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0) {
       fruitPrices[i].pricePerKg = pricePerKg;
       Serial.print("Price updated: ");
-      Serial.print(fruitType);
+      Serial.print(canonicalFruit);
+      if (strcmp(canonicalFruit, fruitType) != 0) {
+        Serial.print(" from ");
+        Serial.print(fruitType);
+      }
       Serial.print(" = PHP ");
       Serial.print(pricePerKg, 2);
       Serial.println("/kg");
@@ -331,7 +407,7 @@ bool setFruitPrice(const char* fruitType, float pricePerKg) {
   }
 
   Serial.print("Ignored price update for unmanaged fruit: ");
-  Serial.println(fruitType);
+  Serial.println(canonicalFruit);
   return false;
 }
 
@@ -857,7 +933,61 @@ void sendCameraCommand(const char* command) {
   }
 }
 
+void applyPriceUpdatePacket(const PriceUpdatePacket& packet) {
+  PriceUpdatePacket cleanPacket = packet;
+  cleanPacket.fruitType[sizeof(cleanPacket.fruitType) - 1] = '\0';
+  if (setFruitPrice(cleanPacket.fruitType, cleanPacket.pricePerKg)) {
+    Serial.print("Worker price sync: ");
+    Serial.print(cleanPacket.fruitType);
+    Serial.print(" = PHP ");
+    Serial.print(cleanPacket.pricePerKg, 2);
+    Serial.println("/kg");
+  }
+}
+
+void removeAcknowledgedSale(const SaleAckPacket& packet) {
+  if (!packet.accepted) {
+    Serial.println("Worker rejected sale packet; will retry");
+    return;
+  }
+
+  char firebaseKey[sizeof(packet.firebaseKey)] = {};
+  strlcpy(firebaseKey, packet.firebaseKey, sizeof(firebaseKey));
+  for (size_t i = 0; i < saleHistoryCount; i++) {
+    if (strcmp(saleHistory[i].firebaseKey, firebaseKey) != 0) {
+      continue;
+    }
+
+    for (size_t j = i + 1; j < saleHistoryCount; j++) {
+      saleHistory[j - 1] = saleHistory[j];
+    }
+    saleHistoryCount--;
+    saleHistory[saleHistoryCount] = SaleRecord{};
+    Serial.print("Worker accepted sale, pending on scale: ");
+    Serial.println(saleHistoryCount);
+    return;
+  }
+}
+
 void onEspNowReceived(const esp_now_recv_info_t* recvInfo, const uint8_t* data, int len) {
+  if (len == sizeof(PriceUpdatePacket)) {
+    PriceUpdatePacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.packetType == PACKET_TYPE_PRICE_UPDATE) {
+      applyPriceUpdatePacket(packet);
+      return;
+    }
+  }
+
+  if (len == sizeof(SaleAckPacket)) {
+    SaleAckPacket packet = {};
+    memcpy(&packet, data, sizeof(packet));
+    if (packet.packetType == PACKET_TYPE_SALE_ACK) {
+      removeAcknowledgedSale(packet);
+      return;
+    }
+  }
+
   if (len != sizeof(DetectionPacket)) {
     return;
   }
@@ -1462,6 +1592,10 @@ bool fetchLatestPriceUpdate() {
 }
 
 void maintainPriceUpdates() {
+  if (useFirebaseWorkerEsp32) {
+    return;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
@@ -1521,10 +1655,50 @@ bool uploadSaleToFirebase(const SaleRecord& sale) {
   return statusCode >= 200 && statusCode < 300;
 }
 
+bool sendSaleToFirebaseWorker(const SaleRecord& sale) {
+  if (!espNowReady) {
+    return false;
+  }
+
+  SaleSyncPacket packet = {};
+  packet.packetType = PACKET_TYPE_SALE_SYNC;
+  packet.sequence = ++saleSyncSequence;
+  packet.saleId = static_cast<uint32_t>(sale.id);
+  packet.createdAtMs = static_cast<uint32_t>(sale.createdAtMs);
+  packet.weightGrams = sale.weightGrams;
+  packet.price = sale.price;
+  packet.pricePerKg = sale.pricePerKg;
+  strlcpy(packet.fruitType, sale.fruitType, sizeof(packet.fruitType));
+  strlcpy(packet.timestamp, sale.timestamp, sizeof(packet.timestamp));
+  strlcpy(packet.date, sale.date, sizeof(packet.date));
+  strlcpy(packet.time, sale.time, sizeof(packet.time));
+  strlcpy(packet.source, sale.source, sizeof(packet.source));
+  strlcpy(packet.firebaseKey, sale.firebaseKey, sizeof(packet.firebaseKey));
+
+  esp_err_t result = esp_now_send(
+    broadcastPeer,
+    reinterpret_cast<uint8_t*>(&packet),
+    sizeof(packet)
+  );
+  if (result != ESP_OK) {
+    Serial.printf("Worker sale send failed: %d\n", result);
+    return false;
+  }
+
+  Serial.print("Sale sent to worker: ");
+  Serial.println(packet.firebaseKey);
+  return true;
+}
+
 bool uploadPendingSales() {
   if (saleHistoryCount == 0) {
     return true;
   }
+
+  if (useFirebaseWorkerEsp32) {
+    return sendSaleToFirebaseWorker(saleHistory[0]);
+  }
+
   if (firebaseUploadBackoffActive()) {
     return false;
   }
@@ -1548,10 +1722,15 @@ bool uploadPendingSales() {
 }
 
 bool maintainPendingSaleUpload() {
-  if (WiFi.status() != WL_CONNECTED ||
-      saleHistoryCount == 0 ||
-      firebaseUploadBackoffActive() ||
-      millis() - lastFirebaseRetryMs < FIREBASE_RETRY_MS) {
+  if (saleHistoryCount == 0) {
+    return true;
+  }
+
+  const unsigned long retryMs =
+    useFirebaseWorkerEsp32 ? WORKER_SALE_RETRY_MS : FIREBASE_RETRY_MS;
+  if ((!useFirebaseWorkerEsp32 &&
+       (WiFi.status() != WL_CONNECTED || firebaseUploadBackoffActive())) ||
+      millis() - lastFirebaseRetryMs < retryMs) {
     return saleHistoryCount == 0;
   }
 
