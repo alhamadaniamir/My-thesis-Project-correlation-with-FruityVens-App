@@ -4,6 +4,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace {
@@ -22,6 +23,7 @@ constexpr uint32_t kFirebaseReadFailureBackoffMs = 60000;
 constexpr uint32_t kFirebaseUploadRetryMs = 500;
 constexpr uint32_t kFirebaseUploadFailureBackoffMs = 15000;
 constexpr size_t kSaleQueueSize = 10;
+constexpr size_t kPriceVersionCacheSize = 40;
 constexpr uint8_t kPacketTypeScaleCommand = 1;
 constexpr uint8_t kPacketTypeDetectionResult = 2;
 constexpr uint8_t kPacketTypeSaleSync = 3;
@@ -75,8 +77,15 @@ struct SaleAckPacket {
   char firebaseKey[80];
 };
 
+struct FruitPriceVersion {
+  char fruitType[32];
+  uint64_t version;
+};
+
 SaleSyncPacket sale_queue[kSaleQueueSize] = {};
+FruitPriceVersion price_versions[kPriceVersionCacheSize] = {};
 size_t sale_queue_count = 0;
+size_t price_version_count = 0;
 uint32_t worker_sequence = 0;
 uint32_t last_price_update_poll_ms = 0;
 uint32_t last_price_table_refresh_ms = 0;
@@ -360,6 +369,12 @@ bool extractJsonNumber(const String& json, const char* key, String& value, int s
   return true;
 }
 
+uint64_t parseUint64(const String& value) {
+  char buffer[24];
+  value.toCharArray(buffer, sizeof(buffer));
+  return strtoull(buffer, nullptr, 10);
+}
+
 bool getFirebaseJson(const String& path, String& payload) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
@@ -386,6 +401,36 @@ bool getFirebaseJson(const String& path, String& payload) {
     return false;
   }
 
+  return true;
+}
+
+bool rememberPriceVersion(const char* fruitType, uint64_t version) {
+  if (version == 0) {
+    return true;
+  }
+
+  for (size_t i = 0; i < price_version_count; i++) {
+    if (strcmp(price_versions[i].fruitType, fruitType) != 0) {
+      continue;
+    }
+    if (version < price_versions[i].version) {
+      return false;
+    }
+    price_versions[i].version = version;
+    return true;
+  }
+
+  if (price_version_count >= kPriceVersionCacheSize) {
+    return true;
+  }
+
+  strlcpy(
+    price_versions[price_version_count].fruitType,
+    fruitType,
+    sizeof(price_versions[price_version_count].fruitType)
+  );
+  price_versions[price_version_count].version = version;
+  price_version_count++;
   return true;
 }
 
@@ -599,6 +644,20 @@ bool applyPriceObject(const String& json, int searchFrom = 0) {
   char fruit_buffer[32];
   fruit.toCharArray(fruit_buffer, sizeof(fruit_buffer));
   const char* scale_fruit = canonicalFruitType(fruit_buffer);
+
+  uint64_t version = 0;
+  String version_text;
+  if (extractJsonNumber(json, "version", version_text, searchFrom)) {
+    version = parseUint64(version_text);
+  }
+  if (!rememberPriceVersion(scale_fruit, version)) {
+    Serial.print("Skipped stale price: ");
+    Serial.print(scale_fruit);
+    Serial.print(" from ");
+    Serial.println(fruit_buffer);
+    return false;
+  }
+
   sendPriceUpdate(scale_fruit, price);
   Serial.print("Broadcast price: ");
   Serial.print(scale_fruit);
