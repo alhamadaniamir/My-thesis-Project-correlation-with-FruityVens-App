@@ -23,8 +23,8 @@
 #define BTN_CANCEL 14
 #define BUZZER_PIN 26
 
-const char* ssid = "Aida_iPhone";
-const char* password = "1234567899";
+const char* ssid = "DITO_3CFF6_2.4";
+const char* password = "48b84252";
 
 const char* firebaseDatabaseUrl = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
 const char* firebaseScaleDeviceId = "fruityvens-scale-01";

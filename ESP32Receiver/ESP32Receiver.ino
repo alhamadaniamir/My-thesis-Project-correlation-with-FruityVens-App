@@ -10,8 +10,8 @@
 namespace {
 
 constexpr char kDeviceName[] = "ESP32 Firebase Worker";
-constexpr char kWifiSsid[] = "Aida_iPhone";
-constexpr char kWifiPassword[] = "1234567899";
+constexpr char kWifiSsid[] = "DITO_3CFF6_2.4";
+constexpr char kWifiPassword[] = "48b84252";
 constexpr char kFirebaseDatabaseUrl[] = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
 constexpr char kFirebaseScaleDeviceId[] = "fruityvens-scale-01";
 constexpr char kFirebaseAuthToken[] = "";
@@ -397,6 +397,12 @@ bool getFirebaseJson(const String& path, String& payload) {
   http.end();
 
   if (statusCode < 200 || statusCode >= 300) {
+    Serial.print("Firebase read HTTP ");
+    Serial.print(statusCode);
+    Serial.print(" path=");
+    Serial.print(path);
+    Serial.print(" response=");
+    Serial.println(payload);
     noteFirebaseReadFailure(statusCode);
     return false;
   }
