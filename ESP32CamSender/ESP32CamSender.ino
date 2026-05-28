@@ -38,6 +38,7 @@ constexpr uint8_t kPacketTypeScaleCommand = 1;
 constexpr uint8_t kPacketTypeDetectionResult = 2;
 
 uint8_t kBroadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr bool kUseStaticIp = false;
 IPAddress kStaticIp(192, 168, 1, 34);
 IPAddress kGatewayIp(192, 168, 1, 1);
 IPAddress kSubnetMask(255, 255, 255, 0);
@@ -499,7 +500,7 @@ bool addBroadcastPeer() {
 
 bool connectWifi() {
   WiFi.mode(WIFI_STA);
-  if (!WiFi.config(kStaticIp, kGatewayIp, kSubnetMask, kDnsIp)) {
+  if (kUseStaticIp && !WiFi.config(kStaticIp, kGatewayIp, kSubnetMask, kDnsIp)) {
     Serial.println("Static IP config failed; DHCP will be used");
   }
   WiFi.begin(kWifiSsid, kWifiPassword);
@@ -547,7 +548,7 @@ bool initEspNow() {
   return true;
 }
 
-bool sendCameraJpeg(bool draw_roi_box) {
+bool sendCameraJpeg(bool draw_roi_box, bool crop_roi) {
   if (!camera_ready) {
     web_server.send(503, "text/plain", "Camera is not ready");
     return false;
@@ -564,14 +565,47 @@ bool sendCameraJpeg(bool draw_roi_box) {
     drawRoiBox(fb);
   }
 
+  camera_fb_t cropped_fb = *fb;
+  camera_fb_t* frame_to_encode = fb;
+  uint8_t* cropped_buffer = nullptr;
+  if (crop_roi) {
+    const RoiRect roi = computeRoiRect(fb->width, fb->height);
+    const size_t cropped_length = static_cast<size_t>(roi.w) * roi.h * 2;
+    cropped_buffer = static_cast<uint8_t*>(
+      psramFound() ? ps_malloc(cropped_length) : malloc(cropped_length)
+    );
+    if (cropped_buffer == nullptr) {
+      esp_camera_fb_return(fb);
+      web_server.send(500, "text/plain", "ROI crop allocation failed");
+      return false;
+    }
+
+    for (int y = 0; y < roi.h; ++y) {
+      const size_t src_offset =
+        (static_cast<size_t>(roi.y + y) * fb->width + roi.x) * 2;
+      const size_t dst_offset = static_cast<size_t>(y) * roi.w * 2;
+      memcpy(cropped_buffer + dst_offset, fb->buf + src_offset, roi.w * 2);
+    }
+
+    cropped_fb.buf = cropped_buffer;
+    cropped_fb.len = cropped_length;
+    cropped_fb.width = roi.w;
+    cropped_fb.height = roi.h;
+    cropped_fb.format = PIXFORMAT_RGB565;
+    frame_to_encode = &cropped_fb;
+  }
+
   uint8_t* jpg_buffer = nullptr;
   size_t jpg_length = 0;
   const bool converted = frame2jpg(
-    fb,
+    frame_to_encode,
     kSnapshotJpegQuality,
     &jpg_buffer,
     &jpg_length
   );
+  if (cropped_buffer != nullptr) {
+    free(cropped_buffer);
+  }
   esp_camera_fb_return(fb);
 
   if (!converted || jpg_buffer == nullptr || jpg_length == 0) {
@@ -596,7 +630,7 @@ void handleSnapshotRequest() {
     return;
   }
 
-  sendCameraJpeg(true);
+  sendCameraJpeg(true, false);
 }
 
 void handleDatasetImageRequest() {
@@ -604,7 +638,8 @@ void handleDatasetImageRequest() {
     setPreviewActive(true, "dataset capture");
   }
 
-  sendCameraJpeg(false);
+  const bool full_frame = web_server.hasArg("full") && web_server.arg("full") == "1";
+  sendCameraJpeg(false, !full_frame);
 }
 
 void handleDatasetPageRequest() {
@@ -621,6 +656,7 @@ void handleDatasetPageRequest() {
     img{width:100%;max-width:560px;background:#000;border:1px solid #3f5566;border-radius:8px;}
     button,select,input{font-size:16px;padding:10px 12px;margin:5px;border-radius:8px;border:0;}
     button{color:white;background:#1565c0;}
+    button.save{background:#2e7d32;}
     button.stop{background:#b71c1c;}
     a{color:#8ee59b;text-decoration:none;}
     .panel{background:#1d2a35;border-radius:10px;padding:16px;}
@@ -647,6 +683,10 @@ void handleDatasetPageRequest() {
           <option>Mixed</option>
           <option>Other</option>
         </select>
+        <select id="frameMode">
+          <option value="crop">Tray crop</option>
+          <option value="full">Full frame</option>
+        </select>
         <button onclick="captureOne()">Capture One</button>
       </div>
       <div class="row">
@@ -655,8 +695,13 @@ void handleDatasetPageRequest() {
         <button onclick="startBurst()">Start Burst</button>
         <button class="stop" onclick="stopBurst()">Stop</button>
       </div>
-      <p class="status" id="status">Saved in browser downloads. Sort files into folders by label.</p>
-      <p class="status">Captured this page: <span class="count" id="captured">0</span></p>
+      <div class="row">
+        <button onclick="chooseFolder()">Choose Folder</button>
+        <button class="save" onclick="saveCaptured()">Save Captured</button>
+        <button class="stop" onclick="clearCaptured()">Clear</button>
+      </div>
+      <p class="status" id="status">Capture images first, then save them together.</p>
+      <p class="status">Pending save: <span class="count" id="captured">0</span></p>
       <p class="status"><a href="/">Back to live preview</a></p>
     </div>
   </main>
@@ -665,9 +710,16 @@ void handleDatasetPageRequest() {
     let burstTimer=null;
     let burstLeft=0;
     let busy=false;
+    let directoryHandle=null;
+    const captures=[];
 
     function cleanLabel(){
       return document.getElementById('label').value.replace(/[^A-Za-z0-9_-]/g,'');
+    }
+
+    function imagePath(){
+      const mode=document.getElementById('frameMode').value;
+      return mode==='full'?'/dataset.jpg?full=1':'/dataset.jpg';
     }
 
     function stamp(){
@@ -678,25 +730,24 @@ void handleDatasetPageRequest() {
       document.getElementById('status').textContent=text;
     }
 
+    function updateCount(){
+      document.getElementById('captured').textContent=captures.length;
+    }
+
     async function captureOne(){
       if(busy){return;}
       busy=true;
       try{
         const label=cleanLabel();
-        const r=await fetch('/dataset.jpg?ts='+Date.now());
+        const r=await fetch(imagePath()+(imagePath().includes('?')?'&':'?')+'ts='+Date.now());
         if(!r.ok){throw new Error(await r.text());}
         const blob=await r.blob();
-        const url=URL.createObjectURL(blob);
-        const a=document.createElement('a');
-        a.href=url;
-        a.download=label+'_'+stamp()+'_'+String(captured+1).padStart(4,'0')+'.jpg';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(()=>URL.revokeObjectURL(url),1000);
+        const mode=document.getElementById('frameMode').value;
+        const filename=label+'_'+mode+'_'+stamp()+'_'+String(captured+1).padStart(4,'0')+'.jpg';
+        captures.push({label,filename,blob});
         captured++;
-        document.getElementById('captured').textContent=captured;
-        setStatus('Captured '+a.download);
+        updateCount();
+        setStatus('Captured '+filename+' and queued for saving');
       }catch(e){
         setStatus('Capture failed: '+e.message);
       }
@@ -724,8 +775,169 @@ void handleDatasetPageRequest() {
       }
     }
 
+    async function chooseFolder(){
+      if(!('showDirectoryPicker' in window)){
+        setStatus('Folder picker not supported. Save Captured will use browser downloads.');
+        return;
+      }
+      try{
+        directoryHandle=await window.showDirectoryPicker();
+        setStatus('Folder selected. Captures will save there.');
+      }catch(e){
+        setStatus('Folder was not selected');
+      }
+    }
+
+    function downloadBlob(filename,blob){
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),1000);
+    }
+
+    const crcTable=(()=>{
+      const table=[];
+      for(let n=0;n<256;n++){
+        let c=n;
+        for(let k=0;k<8;k++){
+          c=(c&1)?(0xedb88320^(c>>>1)):(c>>>1);
+        }
+        table[n]=c>>>0;
+      }
+      return table;
+    })();
+
+    function crc32(bytes){
+      let c=0xffffffff;
+      for(let i=0;i<bytes.length;i++){
+        c=crcTable[(c^bytes[i])&0xff]^(c>>>8);
+      }
+      return (c^0xffffffff)>>>0;
+    }
+
+    function write16(view,offset,value){
+      view.setUint16(offset,value,true);
+    }
+
+    function write32(view,offset,value){
+      view.setUint32(offset,value>>>0,true);
+    }
+
+    async function makeZip(items){
+      const encoder=new TextEncoder();
+      const chunks=[];
+      const central=[];
+      let offset=0;
+
+      for(const item of items){
+        const nameBytes=encoder.encode(item.label+'/'+item.filename);
+        const data=new Uint8Array(await item.blob.arrayBuffer());
+        const crc=crc32(data);
+
+        const local=new Uint8Array(30+nameBytes.length);
+        const lv=new DataView(local.buffer);
+        write32(lv,0,0x04034b50);
+        write16(lv,4,20);
+        write16(lv,6,0);
+        write16(lv,8,0);
+        write16(lv,10,0);
+        write16(lv,12,0);
+        write32(lv,14,crc);
+        write32(lv,18,data.length);
+        write32(lv,22,data.length);
+        write16(lv,26,nameBytes.length);
+        write16(lv,28,0);
+        local.set(nameBytes,30);
+        chunks.push(local,data);
+
+        const dir=new Uint8Array(46+nameBytes.length);
+        const dv=new DataView(dir.buffer);
+        write32(dv,0,0x02014b50);
+        write16(dv,4,20);
+        write16(dv,6,20);
+        write16(dv,8,0);
+        write16(dv,10,0);
+        write16(dv,12,0);
+        write16(dv,14,0);
+        write32(dv,16,crc);
+        write32(dv,20,data.length);
+        write32(dv,24,data.length);
+        write16(dv,28,nameBytes.length);
+        write16(dv,30,0);
+        write16(dv,32,0);
+        write16(dv,34,0);
+        write16(dv,36,0);
+        write32(dv,38,0);
+        write32(dv,42,offset);
+        dir.set(nameBytes,46);
+        central.push(dir);
+
+        offset+=local.length+data.length;
+      }
+
+      const centralOffset=offset;
+      let centralSize=0;
+      for(const dir of central){
+        chunks.push(dir);
+        centralSize+=dir.length;
+      }
+
+      const end=new Uint8Array(22);
+      const ev=new DataView(end.buffer);
+      write32(ev,0,0x06054b50);
+      write16(ev,4,0);
+      write16(ev,6,0);
+      write16(ev,8,items.length);
+      write16(ev,10,items.length);
+      write32(ev,12,centralSize);
+      write32(ev,16,centralOffset);
+      write16(ev,20,0);
+      chunks.push(end);
+
+      return new Blob(chunks,{type:'application/zip'});
+    }
+
+    async function saveCaptured(){
+      if(captures.length===0){
+        setStatus('No captures to save');
+        return;
+      }
+
+      try{
+        if(directoryHandle!==null){
+          for(const item of captures){
+            const targetDir=await directoryHandle.getDirectoryHandle(item.label,{create:true});
+            const fileHandle=await targetDir.getFileHandle(item.filename,{create:true});
+            const writable=await fileHandle.createWritable();
+            await writable.write(item.blob);
+            await writable.close();
+          }
+          setStatus('Saved '+captures.length+' images to selected folder');
+        }else{
+          const zip=await makeZip(captures);
+          downloadBlob('FruitCamDataset_'+stamp()+'.zip',zip);
+          setStatus('Downloaded ZIP with '+captures.length+' images');
+        }
+        captures.length=0;
+        updateCount();
+      }catch(e){
+        setStatus('Save failed: '+e.message);
+      }
+    }
+
+    function clearCaptured(){
+      captures.length=0;
+      updateCount();
+      setStatus('Capture queue cleared');
+    }
+
     setInterval(()=>{
-      document.getElementById('preview').src='/dataset.jpg?ts='+Date.now();
+      const path=imagePath();
+      document.getElementById('preview').src=path+(path.includes('?')?'&':'?')+'ts='+Date.now();
     },900);
   </script>
 </body>
@@ -751,6 +963,7 @@ void startWebServer() {
     button{font-size:18px;padding:12px 18px;margin:6px;border:0;border-radius:8px;color:white;}
     .on{background:#2e7d32;}.off{background:#b71c1c;}.test{background:#1565c0;}
     .controls{margin-top:10px;}
+    a{color:#8ee59b;text-decoration:none;}
     .panel{background:#1d2a35;border-radius:10px;padding:16px;}
     .fruit{font-size:34px;font-weight:700;margin:12px 0;word-break:break-word;}
     .confidence{font-size:18px;color:#8ee59b;margin-bottom:8px;}
@@ -777,6 +990,7 @@ void startWebServer() {
         <button class="test" onclick="cmd('/detect/start')">Detect Test</button>
         <button class="off" onclick="cmd('/detect/stop')">Stop</button>
       </div>
+      <p class="meta"><a href="/dataset">Dataset Capture</a></p>
       <div class="monitor">
         <div class="monitor-title">Mini monitor</div>
         <pre class="monitor-line" id="monitorLine">Waiting for scale detection...</pre>
@@ -870,6 +1084,14 @@ void startWebServer() {
 
   web_server.on("/snapshot.jpg", []() {
     handleSnapshotRequest();
+  });
+
+  web_server.on("/dataset", []() {
+    handleDatasetPageRequest();
+  });
+
+  web_server.on("/dataset.jpg", []() {
+    handleDatasetImageRequest();
   });
 
   web_server.on("/preview/start", []() {
