@@ -547,24 +547,22 @@ bool initEspNow() {
   return true;
 }
 
-void handleSnapshotRequest() {
+bool sendCameraJpeg(bool draw_roi_box) {
   if (!camera_ready) {
     web_server.send(503, "text/plain", "Camera is not ready");
-    return;
-  }
-  if (!cameraOutputActive()) {
-    web_server.send(409, "text/plain", "Camera is idle");
-    return;
+    return false;
   }
 
   last_preview_ms = millis();
   camera_fb_t* fb = esp_camera_fb_get();
   if (fb == nullptr) {
     web_server.send(503, "text/plain", "Camera capture failed");
-    return;
+    return false;
   }
 
-  drawRoiBox(fb);
+  if (draw_roi_box) {
+    drawRoiBox(fb);
+  }
 
   uint8_t* jpg_buffer = nullptr;
   size_t jpg_length = 0;
@@ -581,7 +579,7 @@ void handleSnapshotRequest() {
       free(jpg_buffer);
     }
     web_server.send(500, "text/plain", "JPEG conversion failed");
-    return;
+    return false;
   }
 
   web_server.sendHeader("Cache-Control", "no-store");
@@ -589,6 +587,152 @@ void handleSnapshotRequest() {
   web_server.send(200, "image/jpeg", "");
   web_server.client().write(jpg_buffer, jpg_length);
   free(jpg_buffer);
+  return true;
+}
+
+void handleSnapshotRequest() {
+  if (!cameraOutputActive()) {
+    web_server.send(409, "text/plain", "Camera is idle");
+    return;
+  }
+
+  sendCameraJpeg(true);
+}
+
+void handleDatasetImageRequest() {
+  if (!preview_active) {
+    setPreviewActive(true, "dataset capture");
+  }
+
+  sendCameraJpeg(false);
+}
+
+void handleDatasetPageRequest() {
+  const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>FruitCam Dataset Capture</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Arial,sans-serif;background:#101820;color:white;margin:0;padding:18px;text-align:center;}
+    main{max-width:620px;margin:0 auto;}
+    h2{margin:10px 0 14px;}
+    img{width:100%;max-width:560px;background:#000;border:1px solid #3f5566;border-radius:8px;}
+    button,select,input{font-size:16px;padding:10px 12px;margin:5px;border-radius:8px;border:0;}
+    button{color:white;background:#1565c0;}
+    button.stop{background:#b71c1c;}
+    a{color:#8ee59b;text-decoration:none;}
+    .panel{background:#1d2a35;border-radius:10px;padding:16px;}
+    .row{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:6px;margin:8px 0;}
+    .status{color:#b8c1cc;font-size:14px;line-height:1.4;min-height:20px;}
+    .count{color:#8ee59b;font-weight:700;}
+  </style>
+</head>
+<body>
+  <main>
+    <h2>Dataset Capture</h2>
+    <div class="panel">
+      <img id="preview" src="/dataset.jpg">
+      <div class="row">
+        <select id="label">
+          <option>Apple</option>
+          <option>Orange</option>
+          <option>Banana</option>
+          <option>Mango</option>
+          <option>Pear</option>
+          <option>Empty</option>
+          <option>Hand</option>
+          <option>PlasticBag</option>
+          <option>Mixed</option>
+          <option>Other</option>
+        </select>
+        <button onclick="captureOne()">Capture One</button>
+      </div>
+      <div class="row">
+        <input id="burstCount" type="number" min="1" max="100" value="20">
+        <input id="burstDelay" type="number" min="300" max="5000" value="900">
+        <button onclick="startBurst()">Start Burst</button>
+        <button class="stop" onclick="stopBurst()">Stop</button>
+      </div>
+      <p class="status" id="status">Saved in browser downloads. Sort files into folders by label.</p>
+      <p class="status">Captured this page: <span class="count" id="captured">0</span></p>
+      <p class="status"><a href="/">Back to live preview</a></p>
+    </div>
+  </main>
+  <script>
+    let captured=0;
+    let burstTimer=null;
+    let burstLeft=0;
+    let busy=false;
+
+    function cleanLabel(){
+      return document.getElementById('label').value.replace(/[^A-Za-z0-9_-]/g,'');
+    }
+
+    function stamp(){
+      return new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);
+    }
+
+    function setStatus(text){
+      document.getElementById('status').textContent=text;
+    }
+
+    async function captureOne(){
+      if(busy){return;}
+      busy=true;
+      try{
+        const label=cleanLabel();
+        const r=await fetch('/dataset.jpg?ts='+Date.now());
+        if(!r.ok){throw new Error(await r.text());}
+        const blob=await r.blob();
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');
+        a.href=url;
+        a.download=label+'_'+stamp()+'_'+String(captured+1).padStart(4,'0')+'.jpg';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),1000);
+        captured++;
+        document.getElementById('captured').textContent=captured;
+        setStatus('Captured '+a.download);
+      }catch(e){
+        setStatus('Capture failed: '+e.message);
+      }
+      busy=false;
+    }
+
+    function startBurst(){
+      stopBurst();
+      burstLeft=Math.max(1,Math.min(100,Number(document.getElementById('burstCount').value)||20));
+      const delay=Math.max(300,Math.min(5000,Number(document.getElementById('burstDelay').value)||900));
+      setStatus('Burst running: '+burstLeft+' images');
+      burstTimer=setInterval(async()=>{
+        if(burstLeft<=0){stopBurst();return;}
+        await captureOne();
+        burstLeft--;
+        if(burstLeft<=0){stopBurst();}
+      },delay);
+    }
+
+    function stopBurst(){
+      if(burstTimer!==null){
+        clearInterval(burstTimer);
+        burstTimer=null;
+        setStatus('Burst stopped');
+      }
+    }
+
+    setInterval(()=>{
+      document.getElementById('preview').src='/dataset.jpg?ts='+Date.now();
+    },900);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  web_server.send(200, "text/html", html);
 }
 
 void startWebServer() {
