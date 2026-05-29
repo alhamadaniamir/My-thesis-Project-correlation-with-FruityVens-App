@@ -13,123 +13,19 @@
 #include <math.h>
 #include <string.h>
 
-#define HX_DOUT 23
-#define HX_SCK 22
+#include "protocol.h"
+#include "config.h"
+#include "json_utils.h"
+#include "prices.h"
 
-#define I2C_SDA 18
-#define I2C_SCL 21
-
-#define BTN_SUCCESS 12
-#define BTN_CANCEL 14
-#define BUZZER_PIN 26
-
-const char* ssid = "DITO_3CFF6_2.4";
-const char* password = "48b84252";
-
-const char* firebaseDatabaseUrl = "https://fruityv-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* firebaseScaleDeviceId = "fruityvens-scale-01";
-const char* firebaseAuthToken = "";
-const bool useFirebaseWorkerEsp32 = true;
-
-const char* ntpServer = "time.google.com";
-const long gmtOffset_sec = 8 * 3600;
-const int daylightOffset_sec = 0;
-
-const int LCD_COLS = 20;
-const int LCD_ROWS = 4;
-const int calVal_eepromAddress = 0;
-
-const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0;
-const float PREVIOUS_CALIBRATION_FACTOR = 0.1012;
-const float DEFAULT_CALIBRATION_FACTOR = 0.0102;
-const float CALIBRATION_STEP = 0.001;
-const unsigned long DISPLAY_INTERVAL_MS = 300;
-const unsigned long SERIAL_DIAGNOSTIC_INTERVAL_MS = 500;
-const unsigned long BUTTON_DEBOUNCE_MS = 40;
-const unsigned long BUTTON_COOLDOWN_MS = 300;
-const unsigned long MESSAGE_DISPLAY_MS = 1000;
-const unsigned long WIFI_RESULT_DISPLAY_MS = 2000;
-const unsigned long TARE_TIMEOUT_MS = 5000;
-const unsigned long PRICE_UPDATE_POLL_MS = 5000;
-const unsigned long PRICE_TABLE_REFRESH_MS = 60000;
-const unsigned long FIREBASE_HTTP_TIMEOUT_MS = 1500;
-const unsigned long FIREBASE_RETRY_MS = 5000;
-const unsigned long WORKER_SALE_RETRY_MS = 1000;
-const unsigned long FIREBASE_READ_FAILURE_BACKOFF_MS = 60000;
-const unsigned long FIREBASE_UPLOAD_FAILURE_BACKOFF_MS = 15000;
-const unsigned int BUZZER_BEEP_MS = 220;
-const unsigned int BUZZER_PAUSE_MS = 120;
-const float OBJECT_DETECT_GRAMS = 5.0;
-const float OBJECT_REMOVE_GRAMS = 2.0;
-const float NOISE_FLOOR_GRAMS = 2.0;
-const float WEIGHT_FILTER_ALPHA = 0.45;
-const float FAST_WEIGHT_FILTER_ALPHA = 0.85;
-const float FAST_WEIGHT_DELTA_GRAMS = 20.0;
-const float LOCK_STABLE_TOLERANCE_GRAMS = 1.0;
-const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
-const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
-const uint8_t LOCK_MATCH_SAMPLES = 10;
-const size_t SALE_HISTORY_SIZE = 10;
-const float FRUIT_DETECTION_CONFIDENCE = 0.0;
-const unsigned long CAMERA_START_DELAY_MS = 1000;
-const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 12000;
-const uint8_t PACKET_TYPE_SCALE_COMMAND = 1;
-const uint8_t PACKET_TYPE_DETECTION_RESULT = 2;
-const uint8_t PACKET_TYPE_SALE_SYNC = 3;
-const uint8_t PACKET_TYPE_PRICE_UPDATE = 4;
-const uint8_t PACKET_TYPE_SALE_ACK = 5;
+// Aliases for the packet-type names this sketch already used.
+constexpr uint8_t PACKET_TYPE_SCALE_COMMAND = kPacketTypeScaleCommand;
+constexpr uint8_t PACKET_TYPE_DETECTION_RESULT = kPacketTypeDetectionResult;
+constexpr uint8_t PACKET_TYPE_SALE_SYNC = kPacketTypeSaleSync;
+constexpr uint8_t PACKET_TYPE_PRICE_UPDATE = kPacketTypePriceUpdate;
+constexpr uint8_t PACKET_TYPE_SALE_ACK = kPacketTypeSaleAck;
 
 uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-struct ScaleCommandPacket {
-  uint8_t packetType;
-  char command[16];
-  uint32_t sequence;
-  uint32_t uptime_ms;
-};
-
-struct DetectionPacket {
-  uint8_t packetType;
-  char label[32];
-  float confidence;
-  uint32_t sequence;
-  uint32_t uptime_ms;
-};
-
-struct SaleSyncPacket {
-  uint8_t packetType;
-  uint32_t sequence;
-  uint32_t saleId;
-  uint32_t createdAtMs;
-  float weightGrams;
-  float price;
-  float pricePerKg;
-  char fruitType[32];
-  char timestamp[25];
-  char date[11];
-  char time[9];
-  char source[16];
-  char firebaseKey[80];
-};
-
-struct PriceUpdatePacket {
-  uint8_t packetType;
-  uint32_t sequence;
-  float pricePerKg;
-  char fruitType[32];
-};
-
-struct SaleAckPacket {
-  uint8_t packetType;
-  uint32_t sequence;
-  bool accepted;
-  char firebaseKey[80];
-};
-
-struct FruitPrice {
-  const char* fruitType;
-  float pricePerKg;
-};
 
 struct SaleRecord {
   unsigned long id;
@@ -143,42 +39,6 @@ struct SaleRecord {
   char source[16];
   char firebaseKey[80];
   unsigned long createdAtMs;
-};
-
-FruitPrice fruitPrices[] = {
-  {"Apple", 90.0},
-  {"Orange", 85.0},
-  {"Banana", 35.0},
-  {"Mango", 60.0},
-  {"Grapes", 130.0},
-  {"Lemon", 70.0},
-  {"Papaya", 50.0},
-  {"Watermelon", 50.0},
-  {"Pineapple", 45.0},
-  {"Calamansi", 65.0},
-  {"Pomelo", 95.0},
-  {"Guava", 50.0},
-  {"Avocado", 110.0},
-  {"Coconut", 35.0},
-  {"Dalandan", 75.0},
-  {"Dragon Fruit", 140.0},
-  {"Durian", 180.0},
-  {"Mangosteen", 160.0},
-  {"Rambutan", 120.0},
-  {"Lanzones", 120.0},
-  {"Chico", 80.0},
-  {"Atis", 95.0},
-  {"Santol", 70.0},
-  {"Star Apple", 90.0},
-  {"Jackfruit", 65.0},
-  {"Tamarind", 75.0},
-  {"Melon", 55.0},
-  {"Guyabano", 100.0},
-  {"Mango Carabao", 80.0},
-  {"Indian Mango", 75.0},
-  {"Langkatan", 45.0},
-  {"Pear", 95.0},
-  {"Strawberries", 120.0},
 };
 
 hd44780_I2Cexp lcd(0x27);
@@ -246,8 +106,6 @@ bool saleConfirmedForCurrentObject = false;
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
 String saleRecordJson(const SaleRecord& sale, const String& indent);
-String firebaseSafeKey(const char* value);
-String firebaseSafeKey(const String& value);
 bool uploadPendingSales();
 bool maintainPendingSaleUpload();
 bool sendSaleToFirebaseWorker(const SaleRecord& sale);
@@ -258,8 +116,6 @@ void maintainFruitDetection();
 void maintainPriceUpdates();
 bool fetchPriceTable();
 bool fetchLatestPriceUpdate();
-bool hasFruitPrice(const char* fruitType);
-float pricePerKgForFruit(const char* fruitType);
 
 float calculatePrice(float weightGrams) {
   if (weightGrams < 0) weightGrams = 0;
@@ -271,62 +127,10 @@ float calculatePriceForFruit(const char* fruitType, float weightGrams) {
   return (weightGrams / 1000.0) * pricePerKgForFruit(fruitType);
 }
 
-const char* canonicalFruitType(const char* fruitType) {
-  if (fruitType == nullptr || strlen(fruitType) == 0) {
-    return "";
-  }
-
-  if (strcmp(fruitType, "Grape") == 0 ||
-      strcmp(fruitType, "Grape Blue") == 0 ||
-      strcmp(fruitType, "Grape Pink") == 0 ||
-      strcmp(fruitType, "Grape White") == 0) {
-    return "Grapes";
-  }
-  if (strcmp(fruitType, "Strawberry") == 0) {
-    return "Strawberries";
-  }
-  if (strcmp(fruitType, "Mango Carabao") == 0 ||
-      strcmp(fruitType, "Indian Mango") == 0 ||
-      strcmp(fruitType, "Mango Red") == 0) {
-    return "Mango";
-  }
-  if (strcmp(fruitType, "Lime") == 0 || strcmp(fruitType, "Limes") == 0) {
-    return "Lemon";
-  }
-  if (strcmp(fruitType, "Mandarine") == 0) {
-    return "Orange";
-  }
-  if (strcmp(fruitType, "Pomelo Sweetie") == 0) {
-    return "Pomelo";
-  }
-
-  return fruitType;
-}
-
 const char* scaleStatusText() {
   if (weightLocked) return "locked";
   if (objectPresent) return "weighing";
   return "zero";
-}
-
-String jsonEscape(const char* value) {
-  String escaped = "";
-  for (size_t i = 0; value[i] != '\0'; i++) {
-    char c = value[i];
-    if (c == '"' || c == '\\') {
-      escaped += '\\';
-      escaped += c;
-    } else if (c == '\n') {
-      escaped += "\\n";
-    } else if (c == '\r') {
-      escaped += "\\r";
-    } else if (c == '\t') {
-      escaped += "\\t";
-    } else {
-      escaped += c;
-    }
-  }
-  return escaped;
 }
 
 bool isValidCalibrationFactor(float value) {
@@ -353,62 +157,6 @@ void formatDisplayWeight(float weightGrams, char* buffer, size_t bufferSize) {
 
   const float weightKg = weightGrams / 1000.0f;
   snprintf(buffer, bufferSize, "%.2fkg", weightKg);
-}
-
-bool hasFruitPrice(const char* fruitType) {
-  const char* canonicalFruit = canonicalFruitType(fruitType);
-  if (strlen(canonicalFruit) == 0) {
-    return false;
-  }
-
-  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0 &&
-        fruitPrices[i].pricePerKg > 0.0f) {
-      return true;
-    }
-  }
-  return false;
-}
-
-float pricePerKgForFruit(const char* fruitType) {
-  const char* canonicalFruit = canonicalFruitType(fruitType);
-  if (strlen(canonicalFruit) == 0) {
-    return 0.0f;
-  }
-
-  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0) {
-      return fruitPrices[i].pricePerKg;
-    }
-  }
-  return 0.0f;
-}
-
-bool setFruitPrice(const char* fruitType, float pricePerKg) {
-  const char* canonicalFruit = canonicalFruitType(fruitType);
-  if (strlen(canonicalFruit) == 0 || pricePerKg <= 0.0f) {
-    return false;
-  }
-
-  for (size_t i = 0; i < sizeof(fruitPrices) / sizeof(fruitPrices[0]); i++) {
-    if (strcmp(fruitPrices[i].fruitType, canonicalFruit) == 0) {
-      fruitPrices[i].pricePerKg = pricePerKg;
-      Serial.print("Price updated: ");
-      Serial.print(canonicalFruit);
-      if (strcmp(canonicalFruit, fruitType) != 0) {
-        Serial.print(" from ");
-        Serial.print(fruitType);
-      }
-      Serial.print(" = PHP ");
-      Serial.print(pricePerKg, 2);
-      Serial.println("/kg");
-      return true;
-    }
-  }
-
-  Serial.print("Ignored price update for unmanaged fruit: ");
-  Serial.println(canonicalFruit);
-  return false;
 }
 
 void beginButton(ButtonState &button) {
@@ -629,7 +377,7 @@ SaleRecord confirmSale(const char* reason, const char* source) {
   }
 
   if (cameraDetectionRequested ||
-      strcmp(currentFruitType, "Processing") == 0 ||
+      strcmp(currentFruitType, "Identifying") == 0 ||
       strcmp(currentFruitType, "Settling") == 0 ||
       !cameraResultReceived) {
     showMessage("Detecting fruit", "Please wait");
@@ -933,18 +681,6 @@ void sendCameraCommand(const char* command) {
   }
 }
 
-void applyPriceUpdatePacket(const PriceUpdatePacket& packet) {
-  PriceUpdatePacket cleanPacket = packet;
-  cleanPacket.fruitType[sizeof(cleanPacket.fruitType) - 1] = '\0';
-  if (setFruitPrice(cleanPacket.fruitType, cleanPacket.pricePerKg)) {
-    Serial.print("Worker price sync: ");
-    Serial.print(cleanPacket.fruitType);
-    Serial.print(" = PHP ");
-    Serial.print(cleanPacket.pricePerKg, 2);
-    Serial.println("/kg");
-  }
-}
-
 void removeAcknowledgedSale(const SaleAckPacket& packet) {
   if (!packet.accepted) {
     Serial.println("Worker rejected sale packet; will retry");
@@ -1051,7 +787,7 @@ void requestFruitDetection() {
   cameraScanAttemptedForCurrentObject = true;
   cameraDetectionRequested = true;
   cameraDetectionStartedMs = millis();
-  strlcpy(currentFruitType, "Processing", sizeof(currentFruitType));
+  strlcpy(currentFruitType, "Identifying", sizeof(currentFruitType));
   sendCameraCommand("START");
 }
 
@@ -1299,28 +1035,6 @@ void updateDisplay() {
   printPadded(0, 3, line);
 }
 
-String firebaseSafeKey(const char* value) {
-  String key = "";
-  for (size_t i = 0; value[i] != '\0'; i++) {
-    const char c = value[i];
-    if ((c >= 'A' && c <= 'Z') ||
-        (c >= 'a' && c <= 'z') ||
-        (c >= '0' && c <= '9') ||
-        c == '-' || c == '_') {
-      key += c;
-    } else {
-      key += '_';
-    }
-  }
-  return key.length() == 0 ? "unknown" : key;
-}
-
-String firebaseSafeKey(const String& value) {
-  char buffer[96];
-  value.toCharArray(buffer, sizeof(buffer));
-  return firebaseSafeKey(buffer);
-}
-
 String firebaseSaleKey(const SaleRecord& sale) {
   if (strlen(sale.firebaseKey) > 0) {
     return firebaseSafeKey(sale.firebaseKey);
@@ -1363,79 +1077,6 @@ String firebaseRequestUrl(const SaleRecord& sale) {
   return firebaseUrlForPath(path);
 }
 
-int jsonValueStart(const String& json, const char* key, int searchFrom = 0) {
-  String pattern = "\"";
-  pattern += key;
-  pattern += "\"";
-  int keyIndex = json.indexOf(pattern, searchFrom);
-  if (keyIndex < 0) {
-    return -1;
-  }
-
-  int colonIndex = json.indexOf(':', keyIndex + pattern.length());
-  if (colonIndex < 0) {
-    return -1;
-  }
-
-  int valueStart = colonIndex + 1;
-  while (valueStart < json.length()) {
-    char c = json.charAt(valueStart);
-    if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
-      break;
-    }
-    valueStart++;
-  }
-  return valueStart;
-}
-
-bool extractJsonString(const String& json, const char* key, String& value, int searchFrom = 0) {
-  int start = jsonValueStart(json, key, searchFrom);
-  if (start < 0 || start >= json.length() || json.charAt(start) != '"') {
-    return false;
-  }
-
-  String parsed = "";
-  bool escaped = false;
-  for (int i = start + 1; i < json.length(); i++) {
-    char c = json.charAt(i);
-    if (escaped) {
-      parsed += c;
-      escaped = false;
-    } else if (c == '\\') {
-      escaped = true;
-    } else if (c == '"') {
-      value = parsed;
-      return true;
-    } else {
-      parsed += c;
-    }
-  }
-  return false;
-}
-
-bool isJsonNumberChar(char c) {
-  return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
-}
-
-bool extractJsonNumber(const String& json, const char* key, String& value, int searchFrom = 0) {
-  int start = jsonValueStart(json, key, searchFrom);
-  if (start < 0 || start >= json.length()) {
-    return false;
-  }
-
-  int end = start;
-  while (end < json.length() && isJsonNumberChar(json.charAt(end))) {
-    end++;
-  }
-
-  if (end == start) {
-    return false;
-  }
-
-  value = json.substring(start, end);
-  return true;
-}
-
 bool firebaseReadBackoffActive() {
   return firebaseReadBackoffUntilMs != 0 &&
          static_cast<long>(firebaseReadBackoffUntilMs - millis()) > 0;
@@ -1472,15 +1113,25 @@ void noteFirebaseUploadFailure(int statusCode = 0) {
   Serial.println();
 }
 
+WiFiClientSecure& sharedTlsClient() {
+  static WiFiClientSecure client;
+  static bool configured = false;
+  if (!configured) {
+    client.setInsecure();
+    configured = true;
+  }
+  return client;
+}
+
 bool getFirebaseJson(const String& path, String& payload) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  WiFiClientSecure& client = sharedTlsClient();
 
   HTTPClient http;
+  http.setReuse(true);
   http.setTimeout(FIREBASE_HTTP_TIMEOUT_MS);
   const String url = firebaseUrlForPath(path);
   if (!http.begin(client, url)) {
@@ -1625,10 +1276,10 @@ bool uploadSaleToFirebase(const SaleRecord& sale) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  WiFiClientSecure& client = sharedTlsClient();
 
   HTTPClient http;
+  http.setReuse(true);
   http.setTimeout(FIREBASE_HTTP_TIMEOUT_MS);
   const String url = firebaseRequestUrl(sale);
   if (!http.begin(client, url)) {
