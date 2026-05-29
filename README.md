@@ -12,6 +12,37 @@ This folder contains the firmware for the three ESP32 boards that make up the sm
 | [`ESP32CamSender/`](ESP32CamSender) | ESP32-CAM (AI Thinker) | Camera: captures JPEG, calls the Vercel/Gemini backend, broadcasts the fruit name. |
 | [`ESP32Receiver/`](ESP32Receiver) | ESP32 Dev Module | Firebase worker (optional): uploads sales to Firebase and relays price updates. |
 
+## Master / Slave Roles
+
+Although ESP-NOW is technically peer-to-peer (every board broadcasts to every other), the system has a clear logical hierarchy:
+
+| Board | Role | Why |
+|---|---|---|
+| **AutomatedWeighing ESP32** | 🟢 **MASTER** (controller) | It owns the whole workflow. It decides *when* to start/stop detection, holds the authoritative weight + sale state, drives the LCD, and is the single source of truth for a transaction. Nothing happens until the master tells it to. |
+| **ESP32-CAM** | 🔵 **SLAVE** (sensor) | It does nothing on its own. It sits idle until the master sends `START`, then captures + identifies and reports the result back. It never initiates a transaction. |
+| **ESP32Receiver** | 🔵 **SLAVE** (worker) | A passive helper. It listens for `SaleSync` packets from the master, uploads them to Firebase, acknowledges them, and relays price updates back. Optional — only used when `useFirebaseWorkerEsp32 = true`. |
+
+**Command flow (who tells whom):**
+
+```
+                 MASTER
+          [AutomatedWeighing ESP32]
+            │                  │
+   "START"/"STOP"          "SaleSync"
+            │                  │
+            ▼                  ▼
+       [ESP32-CAM]       [ESP32Receiver]
+        (SLAVE)             (SLAVE)
+            │                  │
+   "DetectionPacket"    "SaleAck" / "PriceUpdate"
+            │                  │
+            └────► back to MASTER ◄────┘
+```
+
+- The **master** is the only board that initiates actions (start detection, record sale).
+- The **slaves** only ever *respond* to the master and report results back.
+- All three communicate by ESP-NOW broadcast, so they must share the same WiFi channel (inherited from the common router SSID).
+
 ## How It Works
 
 ```
