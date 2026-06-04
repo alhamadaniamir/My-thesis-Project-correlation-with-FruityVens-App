@@ -95,6 +95,7 @@ unsigned long firebaseUploadBackoffUntilMs = 0;
 String lastPriceUpdateVersion = "";
 unsigned long objectPresentStartedMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
+uint8_t cameraDetectionRetries = 0;
 uint32_t cameraCommandSequence = 0;
 uint32_t saleSyncSequence = 0;
 bool espNowReady = false;
@@ -735,6 +736,13 @@ void onEspNowReceived(const esp_now_recv_info_t* recvInfo, const uint8_t* data, 
     return;
   }
 
+  // Ignore detection packets we are no longer waiting for: a result that
+  // arrives after a local timeout (or after the item was removed) must not
+  // overwrite the current label, otherwise the LCD flickers Unknown -> <fruit>.
+  if (!cameraDetectionRequested) {
+    return;
+  }
+
   const bool confident =
     packet.confidence >= FRUIT_DETECTION_CONFIDENCE &&
     strcmp(packet.label, "Unknown") != 0;
@@ -787,6 +795,7 @@ void requestFruitDetection() {
   cameraScanAttemptedForCurrentObject = true;
   cameraDetectionRequested = true;
   cameraDetectionStartedMs = millis();
+  cameraDetectionRetries = 0;
   strlcpy(currentFruitType, "Identifying", sizeof(currentFruitType));
   sendCameraCommand("START");
 }
@@ -812,11 +821,27 @@ void maintainFruitDetection() {
   }
 
   if (millis() - cameraDetectionStartedMs >= CAMERA_DETECTION_TIMEOUT_MS) {
+    // The camera always replies within its own window, so reaching here means
+    // the START or the result packet was dropped. Keep waiting for the real
+    // result: re-send START and reset the timer instead of showing "Unknown".
+    if (cameraDetectionRetries < CAMERA_DETECTION_MAX_RETRIES) {
+      cameraDetectionRetries++;
+      cameraDetectionStartedMs = millis();
+      Serial.print("Camera detection timeout - retrying (");
+      Serial.print(cameraDetectionRetries);
+      Serial.print('/');
+      Serial.print(CAMERA_DETECTION_MAX_RETRIES);
+      Serial.println(')');
+      sendCameraCommand("START");
+      return;
+    }
+
+    // Camera stayed unresponsive across every retry: now fall back to Unknown.
     strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
     cameraDetectionRequested = false;
     cameraResultReceived = true;
     sendCameraCommand("STOP");
-    Serial.println("Camera detection timeout - fruit Unknown");
+    Serial.println("Camera unresponsive after retries - fruit Unknown");
     return;
   }
 }

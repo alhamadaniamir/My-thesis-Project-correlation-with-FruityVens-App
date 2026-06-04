@@ -51,4 +51,12 @@ const uint8_t LOCK_MATCH_SAMPLES = 10;
 
 const float FRUIT_DETECTION_CONFIDENCE = 0.0f;
 const unsigned long CAMERA_START_DELAY_MS = 1000;
-const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 12000;
+// Must exceed the camera's worst case (settle 1.2s + Gemini HTTP up to 15s,
+// hard-capped at 20s on the ESP32-CAM). If the scale times out first it shows
+// "Unknown" and the late camera result then overwrites it, causing the LCD to
+// flash Identifying -> Unknown -> <fruit>. Wait longer than the camera's 20s.
+const unsigned long CAMERA_DETECTION_TIMEOUT_MS = 22000;
+// How many times to re-send START (waiting another timeout window each time)
+// before giving up and showing "Unknown". This only matters if a packet is
+// dropped or the camera is offline; a healthy camera replies on the first try.
+const uint8_t CAMERA_DETECTION_MAX_RETRIES = 3;

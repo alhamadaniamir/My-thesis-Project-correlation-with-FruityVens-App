@@ -69,3 +69,4 @@ constexpr size_t SALE_HISTORY_SIZE = 10;  // compile-time so it can size arrays
 extern const float FRUIT_DETECTION_CONFIDENCE;
 extern const unsigned long CAMERA_START_DELAY_MS;
 extern const unsigned long CAMERA_DETECTION_TIMEOUT_MS;
+extern const uint8_t CAMERA_DETECTION_MAX_RETRIES;
