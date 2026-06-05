@@ -2,8 +2,8 @@
 #include <stdint.h>
 
 constexpr char kDeviceName[] = "ESP32-CAM (Gemini bridge)";
-constexpr char kWifiSsid[] = "DITO_3CFF6_2.4";
-constexpr char kWifiPassword[] = "48b84252";
+constexpr char kWifiSsid[] = "Aida_iPhone";
+constexpr char kWifiPassword[] = "1234567899";
 
 constexpr char kBackendUrl[] = "https://backend-kappa-roan-83.vercel.app/api/identify";
 constexpr char kBackendAuthToken[] = "GSDDk++ltTHQk2lhvQfERYIdrdXFSmb7eDPalal0zqg=";
