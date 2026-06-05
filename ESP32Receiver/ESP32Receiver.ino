@@ -27,8 +27,13 @@ uint32_t worker_sequence = 0;
 uint32_t last_price_update_poll_ms = 0;
 uint32_t last_price_table_refresh_ms = 0;
 uint32_t last_upload_retry_ms = 0;
+uint32_t last_wifi_reconnect_ms = 0;
+uint32_t last_waiting_for_wifi_log_ms = 0;
 volatile bool sale_upload_due_now = false;
 String last_price_update_version = "";
+
+constexpr uint32_t kWifiReconnectIntervalMs = 5000;
+constexpr uint32_t kWaitingForWifiLogIntervalMs = 5000;
 
 String macToString(const uint8_t* mac) {
   char buf[18];
@@ -86,9 +91,29 @@ bool connectWifi() {
     return false;
   }
   Serial.println("WiFi connected");
+  Serial.print("WiFi SSID: ");
+  Serial.println(kWifiSsid);
+  Serial.print("WiFi IP: ");
+  Serial.println(WiFi.localIP());
   Serial.print("WiFi channel: ");
   Serial.println(WiFi.channel());
   return true;
+}
+
+void maintainWifiConnection() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - last_wifi_reconnect_ms < kWifiReconnectIntervalMs) {
+    return;
+  }
+
+  last_wifi_reconnect_ms = now;
+  Serial.println("WiFi disconnected; reconnecting...");
+  WiFi.disconnect(false, false);
+  WiFi.begin(kWifiSsid, kWifiPassword);
 }
 
 bool addEspNowBroadcastPeer() {
@@ -145,26 +170,49 @@ void queueSale(const SaleSyncPacket& incoming) {
   sale.source[sizeof(sale.source) - 1] = '\0';
   sale.firebaseKey[sizeof(sale.firebaseKey) - 1] = '\0';
 
-  if (saleQueued(sale.firebaseKey)) { sendSaleAck(sale.firebaseKey, true); return; }
+  if (saleQueued(sale.firebaseKey)) {
+    Serial.print("Sale already queued, waiting for upload: ");
+    Serial.println(sale.firebaseKey);
+    sale_upload_due_now = true;
+    return;
+  }
   if (sale_queue_count >= kSaleQueueSize) {
     Serial.println("Sale queue full; rejected sale packet");
     sendSaleAck(sale.firebaseKey, false);
     return;
   }
   sale_queue[sale_queue_count++] = sale;
-  sendSaleAck(sale.firebaseKey, true);
   Serial.print("Queued sale ");
   Serial.print(sale.firebaseKey);
+  Serial.print(" fruit=");
+  Serial.print(sale.fruitType);
+  Serial.print(" weight=");
+  Serial.print(sale.weightGrams, 2);
+  Serial.print("g price=");
+  Serial.print(sale.price, 2);
   Serial.print(", pending: ");
   Serial.println(sale_queue_count);
   sale_upload_due_now = true;
 }
 
 void maintainSaleUploads(bool force) {
-  if (WiFi.status() != WL_CONNECTED || sale_queue_count == 0 || firebaseUploadBackoffActive()) return;
+  if (sale_queue_count == 0 || firebaseUploadBackoffActive()) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    const uint32_t now = millis();
+    if (now - last_waiting_for_wifi_log_ms >= kWaitingForWifiLogIntervalMs) {
+      last_waiting_for_wifi_log_ms = now;
+      Serial.print("Sale pending, waiting for WiFi: ");
+      Serial.println(sale_queue[0].firebaseKey);
+    }
+    return;
+  }
   if (!force && millis() - last_upload_retry_ms < kFirebaseUploadRetryMs) return;
   last_upload_retry_ms = millis();
-  if (!uploadSaleToFirebase(sale_queue[0])) return;
+  const SaleSyncPacket uploaded_sale = sale_queue[0];
+  Serial.print("Uploading sale to Firebase: ");
+  Serial.println(uploaded_sale.firebaseKey);
+  if (!uploadSaleToFirebase(uploaded_sale)) return;
+  sendSaleAck(uploaded_sale.firebaseKey, true);
   for (size_t i = 1; i < sale_queue_count; i++) sale_queue[i - 1] = sale_queue[i];
   sale_queue_count--;
   sale_queue[sale_queue_count] = SaleSyncPacket{};
@@ -318,6 +366,8 @@ void setup() {
 }
 
 void loop() {
+  maintainWifiConnection();
+  digitalWrite(kStatusLedPin, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
   maintainQueuedSaleUploads();
   maintainPriceUpdates();
   delay(10);

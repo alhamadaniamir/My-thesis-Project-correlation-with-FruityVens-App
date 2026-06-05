@@ -138,7 +138,10 @@ bool getFirebaseJson(const String& path, String& payload) {
 }
 
 bool uploadSaleToFirebase(const SaleSyncPacket& sale) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Firebase upload skipped: WiFi disconnected");
+    return false;
+  }
   WiFiClientSecure& client = sharedTlsClient();
 
   HTTPClient http;
@@ -152,9 +155,16 @@ bool uploadSaleToFirebase(const SaleSyncPacket& sale) {
   }
   http.addHeader("Content-Type", "application/json");
   const int statusCode = http.PUT(saleRecordJson(sale));
+  const String response = http.getString();
   http.end();
   Serial.print("Firebase upload HTTP ");
-  Serial.println(statusCode);
+  Serial.print(statusCode);
+  if (response.length() > 0) {
+    Serial.print(" response=");
+    Serial.println(response);
+  } else {
+    Serial.println();
+  }
   if (statusCode < 200 || statusCode >= 300) {
     noteFirebaseUploadFailure(statusCode);
     return false;
