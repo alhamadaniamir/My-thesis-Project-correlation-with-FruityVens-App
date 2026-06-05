@@ -63,6 +63,7 @@ extern const float LOCK_STABLE_TOLERANCE_GRAMS;
 extern const uint8_t OBJECT_CONFIRM_SAMPLES;
 extern const uint8_t REMOVE_CONFIRM_SAMPLES;
 extern const uint8_t LOCK_MATCH_SAMPLES;
+extern const unsigned long OBJECT_REDETECT_COOLDOWN_MS;
 
 // --- sales / camera ---
 constexpr size_t SALE_HISTORY_SIZE = 10;  // compile-time so it can size arrays

@@ -94,6 +94,7 @@ unsigned long lastPriceUpdatePollMs = 0;
 unsigned long lastPriceTableRefreshMs = 0;
 unsigned long firebaseReadBackoffUntilMs = 0;
 unsigned long firebaseUploadBackoffUntilMs = 0;
+unsigned long objectRedetectCooldownUntilMs = 0;
 String lastPriceUpdateVersion = "";
 unsigned long objectPresentStartedMs = 0;
 unsigned long cameraDetectionStartedMs = 0;
@@ -105,6 +106,7 @@ bool cameraDetectionRequested = false;
 bool cameraResultReceived = false;
 bool cameraScanAttemptedForCurrentObject = false;
 bool saleConfirmedForCurrentObject = false;
+bool cancelledObjectActive = false;
 
 SaleRecord recordSale(const char* source);
 String saleRecordJson(const SaleRecord& sale);
@@ -131,6 +133,7 @@ float calculatePriceForFruit(const char* fruitType, float weightGrams) {
 }
 
 const char* scaleStatusText() {
+  if (cancelledObjectActive) return "cancelled";
   if (weightLocked) return "locked";
   if (objectPresent) return "weighing";
   return "zero";
@@ -213,6 +216,7 @@ void resetWeightState() {
   objectPresent = false;
   cameraScanAttemptedForCurrentObject = false;
   saleConfirmedForCurrentObject = false;
+  cancelledObjectActive = false;
   lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
   lastLockCandidateGrams = 0.0;
@@ -229,6 +233,15 @@ void resetWeightState() {
   lockMatchCount = 0;
   lockWeightSampleCount = 0;
   objectPresentStartedMs = 0;
+}
+
+bool objectRedetectCooldownActive() {
+  return objectRedetectCooldownUntilMs != 0 &&
+         static_cast<long>(objectRedetectCooldownUntilMs - millis()) > 0;
+}
+
+void startObjectRedetectCooldown() {
+  objectRedetectCooldownUntilMs = millis() + OBJECT_REDETECT_COOLDOWN_MS;
 }
 
 void persistCalibrationFactor(float value) {
@@ -465,6 +478,8 @@ SaleRecord confirmSale(const char* reason, const char* source) {
 void cancelSale(const char* reason) {
   Serial.println(reason);
   stopFruitDetection(false);
+  cancelledObjectActive = true;
+  currentWeightGrams = 0.0;
   strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
   cameraResultReceived = true;
   cameraDetectionRequested = false;
@@ -484,7 +499,64 @@ void updateLockedWeight() {
   const float liveSensorWeightGrams = activeSensorWeightGrams();
 
   if (weightLocked) {
-    currentWeightGrams = lockedWeightGrams;
+    currentWeightGrams = cancelledObjectActive ? 0.0f : lockedWeightGrams;
+    float removalThresholdGrams = OBJECT_REMOVE_GRAMS;
+    const float postLoadRecoveryThresholdGrams = lockedWeightGrams * 0.05f;
+    if (postLoadRecoveryThresholdGrams > removalThresholdGrams) {
+      removalThresholdGrams = postLoadRecoveryThresholdGrams;
+      if (removalThresholdGrams > 100.0f) {
+        removalThresholdGrams = 100.0f;
+      }
+    }
+
+    if (liveSensorWeightGrams <= removalThresholdGrams) {
+      if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
+    } else {
+      objectRemoveCount = 0;
+    }
+
+    if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
+      resetWeightState();
+      startObjectRedetectCooldown();
+      Serial.println("Object removed - zero display resumed");
+      return;
+    }
+
+    if (!cameraResultReceived &&
+        !cameraDetectionRequested &&
+        !cameraScanAttemptedForCurrentObject &&
+        !cancelledObjectActive &&
+        objectPresentStartedMs != 0 &&
+        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
+      requestFruitDetection();
+    }
+    return;
+  }
+
+  if (objectRedetectCooldownActive()) {
+    stopFruitDetection(true);
+    currentWeightGrams = 0.0;
+    objectDetectCount = 0;
+    objectRemoveCount = 0;
+    lockMatchCount = 0;
+    lockWeightSampleCount = 0;
+    lastLockCandidateGrams = 0.0;
+    lockWeightSumGrams = 0.0;
+    return;
+  }
+
+  if (cancelledObjectActive) {
+    currentWeightGrams = 0.0;
+    objectPresent = true;
+    cameraResultReceived = true;
+    cameraDetectionRequested = false;
+    cameraScanAttemptedForCurrentObject = true;
+    objectDetectCount = 0;
+    lockMatchCount = 0;
+    lockWeightSampleCount = 0;
+    lastLockCandidateGrams = 0.0;
+    lockWeightSumGrams = 0.0;
+
     if (liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
       if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
     } else {
@@ -493,16 +565,8 @@ void updateLockedWeight() {
 
     if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
       resetWeightState();
-      Serial.println("Object removed - zero display resumed");
-      return;
-    }
-
-    if (!cameraResultReceived &&
-        !cameraDetectionRequested &&
-        !cameraScanAttemptedForCurrentObject &&
-        objectPresentStartedMs != 0 &&
-        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
-      requestFruitDetection();
+      startObjectRedetectCooldown();
+      Serial.println("Cancelled item removed - zero display resumed");
     }
     return;
   }
@@ -513,6 +577,7 @@ void updateLockedWeight() {
     objectPresent = false;
     cameraScanAttemptedForCurrentObject = false;
     saleConfirmedForCurrentObject = false;
+    cancelledObjectActive = false;
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
     objectRemoveCount = 0;
@@ -1070,7 +1135,9 @@ void updateDisplay() {
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = calculatePrice(billableWeightGrams);
   char statusCode = 'Z';
-  if (weightLocked) {
+  if (cancelledObjectActive) {
+    statusCode = 'Z';
+  } else if (weightLocked) {
     statusCode = 'L';
   } else if (objectPresent) {
     statusCode = 'W';

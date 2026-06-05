@@ -62,7 +62,7 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
                     ◄──ESP-NOW PriceUpdate──┘ (price sync)
 ```
 
-1. **Weight detected** — `AutomatedWeighing` filters the HX711 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (5 g).
+1. **Weight detected** — `AutomatedWeighing` filters the HX711 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (25 g).
 2. **Detection requested** — after `CAMERA_START_DELAY_MS` (1 s) it broadcasts a `"START"` command; the LCD shows `Fruit: Identifying`.
 3. **Image captured** — `ESP32CamSender` snaps the cropped ROI as a JPEG.
 4. **Fruit identified** — the JPEG is POSTed to the Vercel backend, which asks Gemini and returns `{"fruit":"Mango"}`.
@@ -145,10 +145,12 @@ Each sketch has its own config. Update these before flashing:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `OBJECT_DETECT_GRAMS` | 5 g | Minimum weight to count as an object |
+| `OBJECT_DETECT_GRAMS` | 25 g | Minimum weight to count as an object |
+| `OBJECT_REMOVE_GRAMS` | 18 g | Residual weight treated as removed |
+| `OBJECT_REDETECT_COOLDOWN_MS` | 2000 ms | Delay before detecting another object after removal |
 | `LOCK_MATCH_SAMPLES` | 10 | Stable samples required to lock a weight |
 | `CAMERA_START_DELAY_MS` | 1000 ms | Delay before requesting detection |
-| `CAMERA_DETECTION_TIMEOUT_MS` | 12000 ms | Give up on the camera after this |
+| `CAMERA_DETECTION_TIMEOUT_MS` | 22000 ms | Retry camera detection after this |
 | `FRUIT_DETECTION_CONFIDENCE` | 0.0 | Min confidence to accept a label |
 
 ## Related
