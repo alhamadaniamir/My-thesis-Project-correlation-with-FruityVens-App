@@ -73,11 +73,13 @@ float lastSensorWeightGrams = 0.0;
 float lastProcessedWeightGrams = 0.0;
 float lastReturnedWeightGrams = 0.0;
 float lastFilterAlpha = 0.0;
+float activeWeightDirection = 1.0;
 bool hx711Ready = false;
 bool rtcReady = false;
 bool weightLocked = false;
 bool objectPresent = false;
 bool newScaleData = false;
+bool activeWeightDirectionKnown = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
 uint8_t lockMatchCount = 0;
@@ -220,6 +222,8 @@ void resetWeightState() {
   lastProcessedWeightGrams = 0.0;
   lastReturnedWeightGrams = 0.0;
   lastFilterAlpha = 0.0;
+  activeWeightDirection = 1.0;
+  activeWeightDirectionKnown = false;
   objectDetectCount = 0;
   objectRemoveCount = 0;
   lockMatchCount = 0;
@@ -255,6 +259,34 @@ void printScaleHelp() {
   Serial.println("  fruit Mango = set fruit name sent with Firebase sale");
   Serial.println("Serial Monitor: 115200 baud");
   Serial.println("Buttons: released=1, pressed=0");
+}
+
+void rememberActiveWeightDirection() {
+  if (activeWeightDirectionKnown) {
+    return;
+  }
+
+  if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams) ||
+      fabs(lastSensorWeightGrams) < OBJECT_DETECT_GRAMS) {
+    return;
+  }
+
+  activeWeightDirection = lastSensorWeightGrams < 0.0f ? -1.0f : 1.0f;
+  activeWeightDirectionKnown = true;
+}
+
+float activeSensorWeightGrams() {
+  if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams)) {
+    return currentWeightGrams;
+  }
+
+  float weight = activeWeightDirectionKnown
+    ? lastSensorWeightGrams * activeWeightDirection
+    : fabs(lastSensorWeightGrams);
+  if (weight < NOISE_FLOOR_GRAMS) {
+    return 0.0f;
+  }
+  return weight;
 }
 
 float readWeightGrams() {
@@ -431,9 +463,14 @@ SaleRecord confirmSale(const char* reason, const char* source) {
 }
 
 void cancelSale(const char* reason) {
-  showMessage("Cancelled");
+  Serial.println(reason);
+  stopFruitDetection(false);
+  strlcpy(currentFruitType, "Unknown", sizeof(currentFruitType));
+  cameraResultReceived = true;
+  cameraDetectionRequested = false;
+  cameraScanAttemptedForCurrentObject = true;
+  showMessage("Cancelled", "Remove item");
   beepBuzzer(2);
-  tareScale(reason);
 }
 
 void updateLockedWeight() {
@@ -441,10 +478,14 @@ void updateLockedWeight() {
   newScaleData = false;
 
   float liveWeightGrams = readWeightGrams();
+  if (liveWeightGrams >= OBJECT_DETECT_GRAMS) {
+    rememberActiveWeightDirection();
+  }
+  const float liveSensorWeightGrams = activeSensorWeightGrams();
 
   if (weightLocked) {
     currentWeightGrams = lockedWeightGrams;
-    if (liveWeightGrams <= OBJECT_REMOVE_GRAMS) {
+    if (liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
       if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
     } else {
       objectRemoveCount = 0;
@@ -466,7 +507,8 @@ void updateLockedWeight() {
     return;
   }
 
-  if (liveWeightGrams < OBJECT_DETECT_GRAMS) {
+  if (liveWeightGrams < OBJECT_DETECT_GRAMS ||
+      (activeWeightDirectionKnown && liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS)) {
     stopFruitDetection(true);
     objectPresent = false;
     cameraScanAttemptedForCurrentObject = false;
@@ -478,6 +520,8 @@ void updateLockedWeight() {
     lockWeightSampleCount = 0;
     lastLockCandidateGrams = 0.0;
     lockWeightSumGrams = 0.0;
+    activeWeightDirection = 1.0;
+    activeWeightDirectionKnown = false;
     objectPresentStartedMs = 0;
     return;
   }
@@ -1444,7 +1488,7 @@ void handleButtons() {
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
     lastCancelActionMs = nowMs;
-    cancelSale("Cancel button tare");
+    cancelSale("Cancel button pressed");
   }
 }
 
