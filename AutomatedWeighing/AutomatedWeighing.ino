@@ -26,6 +26,8 @@ constexpr uint8_t PACKET_TYPE_PRICE_UPDATE = kPacketTypePriceUpdate;
 constexpr uint8_t PACKET_TYPE_SALE_ACK = kPacketTypeSaleAck;
 
 uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr uint8_t CALIBRATION_SAMPLE_READS = 8;
+constexpr unsigned long CALIBRATION_SAMPLE_TIMEOUT_MS = 3000;
 
 struct SaleRecord {
   unsigned long id;
@@ -58,6 +60,12 @@ ButtonState successButton = { BTN_SUCCESS, false, false, false, false, 0 };
 ButtonState cancelButton = { BTN_CANCEL, false, false, false, false, 0 };
 
 float calibration_factor = DEFAULT_CALIBRATION_FACTOR;
+bool calibrationLearningActive = false;
+unsigned int calibrationLearningSampleCount = 0;
+float calibrationLearningSavedFactor = 0.0;
+float calibrationLearningWeightedFactorSum = 0.0;
+float calibrationLearningWeightSumGrams = 0.0;
+float calibrationLearningCandidateFactor = 0.0;
 float currentWeightGrams = 0.0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastSerialDiagnosticMs = 0;
@@ -119,6 +127,7 @@ void requestFruitDetection();
 void stopFruitDetection(bool clearFruit);
 void maintainFruitDetection();
 void maintainPriceUpdates();
+void showMessage(const char* line1, const char* line2 = "", unsigned long nowMs = millis());
 bool fetchPriceTable();
 bool fetchLatestPriceUpdate();
 
@@ -140,7 +149,7 @@ const char* scaleStatusText() {
 }
 
 bool isValidCalibrationFactor(float value) {
-  return !isnan(value) && !isinf(value) && fabs(value) >= 0.0001 && fabs(value) <= 1000000.0;
+  return !isnan(value) && !isinf(value) && value >= 10.0f && value <= 10000.0f;
 }
 
 void printPadded(uint8_t col, uint8_t row, const char* text) {
@@ -262,13 +271,194 @@ void saveCalibrationFactor(float value) {
   Serial.println(calibration_factor, 6);
 }
 
+void clearCalibrationLearningSession() {
+  calibrationLearningActive = false;
+  calibrationLearningSampleCount = 0;
+  calibrationLearningSavedFactor = 0.0;
+  calibrationLearningWeightedFactorSum = 0.0;
+  calibrationLearningWeightSumGrams = 0.0;
+  calibrationLearningCandidateFactor = 0.0;
+}
+
+void beginCalibrationLearning() {
+  calibrationLearningActive = true;
+  calibrationLearningSampleCount = 0;
+  calibrationLearningSavedFactor = calibration_factor;
+  calibrationLearningWeightedFactorSum = 0.0;
+  calibrationLearningWeightSumGrams = 0.0;
+  calibrationLearningCandidateFactor = calibration_factor;
+
+  Serial.println("Calibration learning started.");
+  Serial.println("Use: t, place known weight, cal add 500");
+  Serial.println("Repeat with other known weights, then use: cal save");
+  Serial.println("Use: cal cancel to return to the last saved factor.");
+  showMessage("Cal learn mode", "Add known wt");
+}
+
+bool hasCalibrationLearningSamples() {
+  return calibrationLearningSampleCount > 0 &&
+         calibrationLearningWeightSumGrams > 0.0f &&
+         isValidCalibrationFactor(calibrationLearningCandidateFactor);
+}
+
+void printCalibrationLearningStatus() {
+  Serial.print("Calibration learning active=");
+  Serial.print(calibrationLearningActive ? "yes" : "no");
+  Serial.print(" samples=");
+  Serial.print(calibrationLearningSampleCount);
+  Serial.print(" current=");
+  Serial.print(calibration_factor, 6);
+  Serial.print(" candidate=");
+  if (hasCalibrationLearningSamples()) {
+    Serial.print(calibrationLearningCandidateFactor, 6);
+  } else {
+    Serial.print("none");
+  }
+  Serial.print(" saved=");
+  Serial.println(calibrationLearningSavedFactor, 6);
+}
+
+bool addCalibrationLearningSample(float knownWeightGrams) {
+  if (!hx711Ready || knownWeightGrams <= 0.0f) {
+    Serial.println("Use: cal add 500");
+    return false;
+  }
+
+  if (!calibrationLearningActive) {
+    beginCalibrationLearning();
+  }
+
+  if (knownWeightGrams < 50.0f) {
+    Serial.println("Small calibration weights are noisy; add a 200g/500g sample before saving.");
+  }
+
+  stopFruitDetection(true);
+
+  float measuredAverageGrams = 0.0f;
+  float measuredMinGrams = 0.0f;
+  float measuredMaxGrams = 0.0f;
+  uint8_t samplesRead = 0;
+  const unsigned long startedMs = millis();
+  while (samplesRead < CALIBRATION_SAMPLE_READS &&
+         millis() - startedMs < CALIBRATION_SAMPLE_TIMEOUT_MS) {
+    if (!LoadCell.update()) {
+      delay(5);
+      continue;
+    }
+
+    lastHx711UpdateMs = millis();
+    const float sampleGrams = LoadCell.getData();
+    if (isnan(sampleGrams) || isinf(sampleGrams)) {
+      continue;
+    }
+
+    if (samplesRead == 0) {
+      measuredMinGrams = sampleGrams;
+      measuredMaxGrams = sampleGrams;
+    } else {
+      if (sampleGrams < measuredMinGrams) measuredMinGrams = sampleGrams;
+      if (sampleGrams > measuredMaxGrams) measuredMaxGrams = sampleGrams;
+    }
+    measuredAverageGrams += sampleGrams;
+    samplesRead++;
+  }
+
+  if (samplesRead < CALIBRATION_SAMPLE_READS) {
+    Serial.println("Calibration sample ignored: HX711 did not provide enough readings.");
+    resetWeightState();
+    return false;
+  }
+
+  measuredAverageGrams /= samplesRead;
+  const float measuredSpreadGrams = fabs(measuredMaxGrams - measuredMinGrams);
+  const float allowedSpreadGrams =
+    knownWeightGrams * 0.01f > 2.0f ? knownWeightGrams * 0.01f : 2.0f;
+  if (measuredSpreadGrams > allowedSpreadGrams) {
+    Serial.print("Calibration sample ignored: unstable reading spread=");
+    Serial.print(measuredSpreadGrams, 2);
+    Serial.print("g allowed=");
+    Serial.print(allowedSpreadGrams, 2);
+    Serial.println("g");
+    showMessage("Cal unstable", "Wait, retry");
+    resetWeightState();
+    return false;
+  }
+
+  const float sampleFactor =
+    (fabs(measuredAverageGrams) * calibration_factor) / knownWeightGrams;
+  if (!isValidCalibrationFactor(sampleFactor)) {
+    Serial.println("Invalid calibration sample ignored.");
+    return false;
+  }
+
+  calibrationLearningWeightedFactorSum += sampleFactor * knownWeightGrams;
+  calibrationLearningWeightSumGrams += knownWeightGrams;
+  calibrationLearningSampleCount++;
+  calibrationLearningCandidateFactor =
+    calibrationLearningWeightedFactorSum / calibrationLearningWeightSumGrams;
+
+  calibration_factor = calibrationLearningCandidateFactor;
+  LoadCell.setCalFactor(calibration_factor);
+  resetWeightState();
+
+  Serial.print("Calibration sample ");
+  Serial.print(calibrationLearningSampleCount);
+  Serial.print(": known=");
+  Serial.print(knownWeightGrams, 2);
+  Serial.print("g measuredAvg=");
+  Serial.print(measuredAverageGrams, 2);
+  Serial.print("g spread=");
+  Serial.print(measuredSpreadGrams, 2);
+  Serial.print("g sampleFactor=");
+  Serial.print(sampleFactor, 6);
+  Serial.print(" candidate=");
+  Serial.println(calibrationLearningCandidateFactor, 6);
+  Serial.println("Not saved yet. Use cal save to store it in EEPROM.");
+
+  showMessage("Cal sample added", "Use cal save");
+  return true;
+}
+
+void saveCalibrationLearning() {
+  if (!calibrationLearningActive || !hasCalibrationLearningSamples()) {
+    Serial.println("No calibration samples to save.");
+    showMessage("No cal samples");
+    return;
+  }
+
+  saveCalibrationFactor(calibrationLearningCandidateFactor);
+  clearCalibrationLearningSession();
+  resetWeightState();
+  showMessage("Calibration saved");
+}
+
+void cancelCalibrationLearning() {
+  if (!calibrationLearningActive) {
+    Serial.println("No calibration learning session is active.");
+    return;
+  }
+
+  calibration_factor = calibrationLearningSavedFactor;
+  LoadCell.setCalFactor(calibration_factor);
+  clearCalibrationLearningSession();
+  resetWeightState();
+  Serial.print("Calibration learning cancelled. Restored factor: ");
+  Serial.println(calibration_factor, 6);
+  showMessage("Cal cancelled");
+}
+
 void printScaleHelp() {
   Serial.println("Commands:");
   Serial.println("  t = tare / zero");
   Serial.println("  + or a = increase calibration factor");
   Serial.println("  - or z = decrease calibration factor");
   Serial.println("  r = reset calibration factor");
-  Serial.println("  c 500 = calibrate with known 500g weight");
+  Serial.println("  cal start = start calibration learning");
+  Serial.println("  cal add 500 = add known 500g sample, not saved yet");
+  Serial.println("  c 500 = same as cal add 500");
+  Serial.println("  cal save = save learned calibration factor");
+  Serial.println("  cal cancel = restore last saved calibration factor");
+  Serial.println("  cal status = show calibration learning status");
   Serial.println("  fruit Mango = set fruit name sent with Firebase sale");
   Serial.println("Serial Monitor: 115200 baud");
   Serial.println("Buttons: released=1, pressed=0");
@@ -380,7 +570,7 @@ void printScaleDiagnostics() {
   Serial.println(nowMs - lastHx711UpdateMs);
 }
 
-void showMessage(const char* line1, const char* line2 = "", unsigned long nowMs = millis()) {
+void showMessage(const char* line1, const char* line2, unsigned long nowMs) {
   lcd.clear();
   lcd.print(line1);
   lcd.setCursor(0, 1);
@@ -416,6 +606,12 @@ void tareScale(const char* reason) {
 }
 
 SaleRecord confirmSale(const char* reason, const char* source) {
+  if (calibrationLearningActive) {
+    showMessage("Calibrating", "No sale saved");
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
   if (currentWeightGrams < OBJECT_DETECT_GRAMS) {
     showMessage("No item on scale");
     beepBuzzer(2);
@@ -525,6 +721,7 @@ void updateLockedWeight() {
     if (!cameraResultReceived &&
         !cameraDetectionRequested &&
         !cameraScanAttemptedForCurrentObject &&
+        !calibrationLearningActive &&
         !cancelledObjectActive &&
         objectPresentStartedMs != 0 &&
         millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
@@ -603,11 +800,16 @@ void updateLockedWeight() {
 
   if (!objectPresent) {
     objectPresentStartedMs = millis();
-    strlcpy(currentFruitType, "Settling", sizeof(currentFruitType));
+    strlcpy(
+      currentFruitType,
+      calibrationLearningActive ? "Calibrating" : "Settling",
+      sizeof(currentFruitType)
+    );
   }
   objectPresent = true;
   if (!cameraResultReceived &&
       !cameraScanAttemptedForCurrentObject &&
+      !calibrationLearningActive &&
       millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
     requestFruitDetection();
   }
@@ -1565,6 +1767,8 @@ void processSerialCommand() {
   String command = Serial.readStringUntil('\n');
   command.trim();
   if (command.length() == 0) return;
+  String lowerCommand = command;
+  lowerCommand.toLowerCase();
 
   if (command == "t" || command == "T") {
     tareScale("Serial tare");
@@ -1582,20 +1786,44 @@ void processSerialCommand() {
   }
 
   if (command == "r" || command == "R") {
+    clearCalibrationLearningSession();
     saveCalibrationFactor(DEFAULT_CALIBRATION_FACTOR);
+    return;
+  }
+
+  if (lowerCommand == "cal start") {
+    beginCalibrationLearning();
+    return;
+  }
+
+  if (lowerCommand == "cal save") {
+    saveCalibrationLearning();
+    return;
+  }
+
+  if (lowerCommand == "cal cancel") {
+    cancelCalibrationLearning();
+    return;
+  }
+
+  if (lowerCommand == "cal status") {
+    printCalibrationLearningStatus();
+    return;
+  }
+
+  if (lowerCommand.startsWith("cal add ")) {
+    addCalibrationLearningSample(command.substring(8).toFloat());
+    return;
+  }
+
+  if (lowerCommand.startsWith("cal ")) {
+    addCalibrationLearningSample(command.substring(4).toFloat());
     return;
   }
 
   if (command[0] == 'c' || command[0] == 'C') {
     float knownWeightGrams = command.substring(1).toFloat();
-    if (!hx711Ready || knownWeightGrams <= 0) {
-      Serial.println("Use: c 500");
-      return;
-    }
-    LoadCell.refreshDataSet();
-    saveCalibrationFactor(LoadCell.getNewCalibration(knownWeightGrams));
-    resetWeightState();
-    currentWeightGrams = readWeightGrams();
+    addCalibrationLearningSample(knownWeightGrams);
     return;
   }
 

@@ -18,8 +18,8 @@ const int calVal_eepromAddress = 0;
 
 const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0f;
 const float PREVIOUS_CALIBRATION_FACTOR = 0.1012f;
-const float DEFAULT_CALIBRATION_FACTOR = 0.0102f;
-const float CALIBRATION_STEP = 0.001f;
+const float DEFAULT_CALIBRATION_FACTOR = 218.306412f;
+const float CALIBRATION_STEP = 1.0f;
 
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 const unsigned long SERIAL_DIAGNOSTIC_INTERVAL_MS = 500;
@@ -38,15 +38,15 @@ const unsigned long FIREBASE_UPLOAD_FAILURE_BACKOFF_MS = 15000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 
-const float OBJECT_DETECT_GRAMS = 25.0f;
-const float OBJECT_REMOVE_GRAMS = 18.0f;
-const float NOISE_FLOOR_GRAMS = 8.0f;
+const float OBJECT_DETECT_GRAMS = 9.0f;
+const float OBJECT_REMOVE_GRAMS = 4.0f;
+const float NOISE_FLOOR_GRAMS = 2.0f;
 const float WEIGHT_FILTER_ALPHA = 0.45f;
 const float FAST_WEIGHT_FILTER_ALPHA = 0.85f;
 const float FAST_WEIGHT_DELTA_GRAMS = 20.0f;
 const float LOCK_STABLE_TOLERANCE_GRAMS = 1.0f;
-const uint8_t OBJECT_CONFIRM_SAMPLES = 1;
-const uint8_t REMOVE_CONFIRM_SAMPLES = 2;
+const uint8_t OBJECT_CONFIRM_SAMPLES = 3;
+const uint8_t REMOVE_CONFIRM_SAMPLES = 3;
 const uint8_t LOCK_MATCH_SAMPLES = 10;
 const unsigned long OBJECT_REDETECT_COOLDOWN_MS = 2000;
 
