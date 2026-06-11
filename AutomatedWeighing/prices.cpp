@@ -13,7 +13,8 @@ static FruitPrice fruitPrices[] = {
   {"Atis", 95.0f},         {"Santol", 70.0f},     {"Star Apple", 90.0f},
   {"Jackfruit", 65.0f},    {"Tamarind", 75.0f},   {"Melon", 55.0f},
   {"Guyabano", 100.0f},    {"Mango Carabao", 80.0f}, {"Indian Mango", 75.0f},
-  {"Langkatan", 45.0f},    {"Pear", 95.0f},       {"Strawberries", 120.0f},
+  {"Apple Mango", 60.0f},  {"Langkatan", 45.0f},  {"Pear", 95.0f},
+  {"Strawberries", 120.0f},
 };
 
 const char* canonicalFruitType(const char* fruitType) {
@@ -23,9 +24,8 @@ const char* canonicalFruitType(const char* fruitType) {
       strcmp(fruitType, "Grape Pink") == 0 ||
       strcmp(fruitType, "Grape White") == 0) return "Grapes";
   if (strcmp(fruitType, "Strawberry") == 0) return "Strawberries";
-  if (strcmp(fruitType, "Mango Carabao") == 0 ||
-      strcmp(fruitType, "Indian Mango") == 0 ||
-      strcmp(fruitType, "Mango Red") == 0) return "Mango";
+  if (strcmp(fruitType, "Carabao Mango") == 0) return "Mango Carabao";
+  if (strcmp(fruitType, "Mango Red") == 0) return "Mango";
   if (strcmp(fruitType, "Lime") == 0 || strcmp(fruitType, "Limes") == 0) return "Lemon";
   if (strcmp(fruitType, "Mandarine") == 0) return "Orange";
   if (strcmp(fruitType, "Pomelo Sweetie") == 0) return "Pomelo";

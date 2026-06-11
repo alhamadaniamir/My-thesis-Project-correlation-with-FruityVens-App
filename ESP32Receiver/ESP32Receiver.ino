@@ -49,9 +49,8 @@ const char* canonicalFruitType(const char* fruitType) {
       strcmp(fruitType, "Grape Pink") == 0 ||
       strcmp(fruitType, "Grape White") == 0) return "Grapes";
   if (strcmp(fruitType, "Strawberry") == 0) return "Strawberries";
-  if (strcmp(fruitType, "Mango Carabao") == 0 ||
-      strcmp(fruitType, "Indian Mango") == 0 ||
-      strcmp(fruitType, "Mango Red") == 0) return "Mango";
+  if (strcmp(fruitType, "Carabao Mango") == 0) return "Mango Carabao";
+  if (strcmp(fruitType, "Mango Red") == 0) return "Mango";
   if (strcmp(fruitType, "Lime") == 0 || strcmp(fruitType, "Limes") == 0) return "Lemon";
   if (strcmp(fruitType, "Mandarine") == 0) return "Orange";
   if (strcmp(fruitType, "Pomelo Sweetie") == 0) return "Pomelo";
