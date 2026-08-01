@@ -2,9 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// --- pins (kept as macros to match original sketch idioms) ---
-#define HX_DOUT 23
-#define HX_SCK 22
+// --- pins ---
 #define I2C_SDA 18
 #define I2C_SCL 21
 #define BTN_SUCCESS 12
@@ -29,8 +27,6 @@ extern const int LCD_ROWS;
 extern const int calVal_eepromAddress;
 
 // --- calibration ---
-extern const float OLD_DEFAULT_CALIBRATION_FACTOR;
-extern const float PREVIOUS_CALIBRATION_FACTOR;
 extern const float DEFAULT_CALIBRATION_FACTOR;
 extern const float CALIBRATION_STEP;
 

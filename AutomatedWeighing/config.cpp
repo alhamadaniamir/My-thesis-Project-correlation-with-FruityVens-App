@@ -14,11 +14,11 @@ const int daylightOffset_sec = 0;
 
 const int LCD_COLS = 20;
 const int LCD_ROWS = 4;
-const int calVal_eepromAddress = 0;
+// Keep NAU7802 calibration separate from the old HX711 value at address 0.
+const int calVal_eepromAddress = 16;
 
-const float OLD_DEFAULT_CALIBRATION_FACTOR = 1.0f;
-const float PREVIOUS_CALIBRATION_FACTOR = 0.1012f;
-const float DEFAULT_CALIBRATION_FACTOR = 218.306412f;
+// This is only a startup value. Recalibrate after installing the NAU7802.
+const float DEFAULT_CALIBRATION_FACTOR = 1.0f;
 const float CALIBRATION_STEP = 1.0f;
 
 const unsigned long DISPLAY_INTERVAL_MS = 300;

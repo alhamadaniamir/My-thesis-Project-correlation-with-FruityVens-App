@@ -1,0 +1,34 @@
+#include <Wire.h>
+#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>
+
+constexpr uint8_t I2C_SDA_PIN = 18;
+constexpr uint8_t I2C_SCL_PIN = 21;
+
+NAU7802 scale;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  Serial.println("NAU7802 load-cell test");
+  if (!scale.begin(Wire)) {
+    Serial.println("NAU7802 not found at 0x2A. Check SDA, SCL, power, and common GND.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("NAU7802 detected. Remove all weight.");
+  delay(3000);
+  scale.calculateZeroOffset(32, 5000);
+  Serial.print("Zero offset: ");
+  Serial.println(scale.getZeroOffset());
+  Serial.println("Raw readings follow. Press the platform to confirm they change.");
+}
+
+void loop() {
+  if (scale.available()) {
+    Serial.print("Raw: ");
+    Serial.println(scale.getReading());
+  }
+}

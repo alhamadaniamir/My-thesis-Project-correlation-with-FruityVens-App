@@ -8,7 +8,7 @@ This folder contains the firmware for the three ESP32 boards that make up the sm
 
 | Sketch | Target Board | Role |
 |---|---|---|
-| [`AutomatedWeighing/`](AutomatedWeighing) | ESP32 Dev Module | Main scale: HX711 load cell, LCD I2C, buttons, buzzer, RTC. Detects weight, requests fruit ID, displays result, records sales. |
+| [`AutomatedWeighing/`](AutomatedWeighing) | ESP32 Dev Module | Main scale: NAU7802 load-cell ADC, LCD I2C, buttons, buzzer, RTC. Detects weight, requests fruit ID, displays result, records sales. |
 | [`ESP32CamSender/`](ESP32CamSender) | ESP32-CAM (AI Thinker) | Camera: captures JPEG, calls the Vercel/Gemini backend, broadcasts the fruit name. |
 | [`ESP32Receiver/`](ESP32Receiver) | ESP32 Dev Module | Firebase worker (optional): uploads sales to Firebase and relays price updates. |
 
@@ -49,7 +49,7 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
 [Fruit on scale]
       │
       ▼
-[HX711] ─► [AutomatedWeighing ESP32] ──ESP-NOW "START"──► [ESP32-CAM]
+[NAU7802] ─► [AutomatedWeighing ESP32] ──ESP-NOW "START"──► [ESP32-CAM]
                     ▲                                          │ capture JPEG
                     │                                          ▼
                     │                                 [Vercel Backend] ─► [Gemini AI]
@@ -62,7 +62,7 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
                     ◄──ESP-NOW PriceUpdate──┘ (price sync)
 ```
 
-1. **Weight detected** — `AutomatedWeighing` filters the HX711 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (25 g).
+1. **Weight detected** — `AutomatedWeighing` filters the NAU7802 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (9 g).
 2. **Detection requested** — after `CAMERA_START_DELAY_MS` (1 s) it broadcasts a `"START"` command; the LCD shows `Fruit: Identifying`.
 3. **Image captured** — `ESP32CamSender` snaps the cropped ROI as a JPEG.
 4. **Fruit identified** — the JPEG is POSTed to the Vercel backend, which asks Gemini and returns `{"fruit":"Mango"}`.
@@ -88,15 +88,37 @@ Communication is by broadcast (`FF:FF:FF:FF:FF:FF`), so no MAC pairing is needed
 
 | Peripheral | Pin |
 |---|---|
-| HX711 DOUT | GPIO 23 |
-| HX711 SCK | GPIO 22 |
-| I2C SDA (LCD + RTC) | GPIO 18 |
-| I2C SCL (LCD + RTC) | GPIO 21 |
+| NAU7802 SDA | GPIO 18 (shared I2C bus) |
+| NAU7802 SCL | GPIO 21 (shared I2C bus) |
+| NAU7802 VCC / 3V3 | Regulated 3.27 V buck output |
+| NAU7802 GND | Buck GND and ESP32 GND (common ground) |
+| NAU7802 INT / DRDY | Not connected |
+| LCD + RTC SDA | GPIO 18 |
+| LCD + RTC SCL | GPIO 21 |
 | Success button | GPIO 12 (INPUT_PULLUP) |
 | Cancel button | GPIO 14 (INPUT_PULLUP) |
 | Buzzer | GPIO 26 |
 | LCD I2C address | `0x27` (20×4) |
 | RTC | DS3231 on I2C |
+| NAU7802 I2C address | `0x2A` |
+
+Typical four-wire load-cell connection:
+
+| Load-cell wire | NAU7802 terminal |
+|---|---|
+| Red | `E+` |
+| Black | `E-` |
+| Green | `A+` |
+| White | `A-` |
+
+Load-cell colors are not universal; verify the label or datasheet supplied with
+your load cell. If weight moves in the wrong direction, swap `A+` and `A-` and
+calibrate again.
+
+The 3.27 V buck supply is suitable for the NAU7802. Its ground must be connected
+to ESP32 ground so the I2C signals have the same reference. Do not connect the
+buck's 3.27 V output and the ESP32 3.3 V output together. Also verify that no
+5 V LCD backpack pull-up is pulling SDA or SCL above 3.3 V.
 
 ## Configuration
 
@@ -106,7 +128,7 @@ Each sketch has its own config. Update these before flashing:
 - `ssid` / `password` — WiFi credentials
 - `firebaseDatabaseUrl` / `firebaseScaleDeviceId` — Firebase target
 - `useFirebaseWorkerEsp32` — `true` = offload uploads to `ESP32Receiver`; `false` = scale uploads directly (no worker board needed)
-- `DEFAULT_CALIBRATION_FACTOR` — load cell calibration (calibrate with `c 500` over Serial using a known 500 g weight)
+- `DEFAULT_CALIBRATION_FACTOR` — NAU7802 startup factor; perform a new calibration after replacing the amplifier
 - `gmtOffset_sec` — `8 * 3600` for PH time (UTC+8)
 
 **`ESP32CamSender/config.h`**
@@ -123,7 +145,7 @@ Each sketch has its own config. Update these before flashing:
 1. Install the **ESP32 board package** (Boards Manager → "esp32" by Espressif).
 2. Install required libraries via Library Manager:
    - `hd44780` (LCD I2C)
-   - `HX711_ADC`
+   - `SparkFun Qwiic Scale NAU7802 Arduino Library`
    - `RTClib`
 3. Select the correct board per sketch:
    - `AutomatedWeighing` / `ESP32Receiver` → **ESP32 Dev Module**
@@ -138,15 +160,24 @@ Each sketch has its own config. Update these before flashing:
 | `t` | Tare / zero the scale |
 | `+` / `-` | Increase / decrease calibration factor |
 | `r` | Reset calibration to default |
-| `c 500` | Calibrate using a known 500 g weight |
+| `c 500` | Add a known 500 g calibration sample |
+| `cal save` | Save the new calibration factor |
 | `fruit Mango` | Manually set the fruit name (skips camera) |
+
+After installing the NAU7802, calibrate it before recording sales:
+
+1. Power on with the platform completely empty; startup performs an automatic tare.
+2. Open Serial Monitor at 115200 baud and send `t` once more with the platform empty.
+3. Place a known weight, such as exactly 500 g, in the center and wait for it to settle.
+4. Send `c 500`, then send `cal save`.
+5. Remove the weight, send `t`, and verify several known weights.
 
 ## Key Tuning Parameters (AutomatedWeighing)
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `OBJECT_DETECT_GRAMS` | 25 g | Minimum weight to count as an object |
-| `OBJECT_REMOVE_GRAMS` | 18 g | Residual weight treated as removed |
+| `OBJECT_DETECT_GRAMS` | 9 g | Minimum weight to count as an object |
+| `OBJECT_REMOVE_GRAMS` | 4 g | Residual weight treated as removed |
 | `OBJECT_REDETECT_COOLDOWN_MS` | 2000 ms | Delay before detecting another object after removal |
 | `LOCK_MATCH_SAMPLES` | 10 | Stable samples required to lock a weight |
 | `CAMERA_START_DELAY_MS` | 1000 ms | Delay before requesting detection |

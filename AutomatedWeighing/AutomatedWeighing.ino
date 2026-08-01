@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <hd44780.h>
 #include <hd44780ioClass/hd44780_I2Cexp.h>
-#include <HX711_ADC.h>
+#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>
 #include <EEPROM.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -27,6 +27,7 @@ constexpr uint8_t PACKET_TYPE_SALE_ACK = kPacketTypeSaleAck;
 
 uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint8_t CALIBRATION_SAMPLE_READS = 8;
+constexpr uint8_t TARE_SAMPLE_READS = 32;
 constexpr unsigned long CALIBRATION_SAMPLE_TIMEOUT_MS = 3000;
 
 struct SaleRecord {
@@ -44,7 +45,7 @@ struct SaleRecord {
 };
 
 hd44780_I2Cexp lcd(0x27);
-HX711_ADC LoadCell(HX_DOUT, HX_SCK);
+NAU7802 loadCell;
 RTC_DS3231 rtc;
 
 struct ButtonState {
@@ -69,7 +70,7 @@ float calibrationLearningCandidateFactor = 0.0;
 float currentWeightGrams = 0.0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastSerialDiagnosticMs = 0;
-unsigned long lastHx711UpdateMs = 0;
+unsigned long lastNau7802UpdateMs = 0;
 unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
 unsigned long messageUntilMs = 0;
@@ -82,7 +83,8 @@ float lastProcessedWeightGrams = 0.0;
 float lastReturnedWeightGrams = 0.0;
 float lastFilterAlpha = 0.0;
 float activeWeightDirection = 1.0;
-bool hx711Ready = false;
+int32_t lastNau7802RawReading = 0;
+bool nau7802Ready = false;
 bool rtcReady = false;
 bool weightLocked = false;
 bool objectPresent = false;
@@ -149,7 +151,9 @@ const char* scaleStatusText() {
 }
 
 bool isValidCalibrationFactor(float value) {
-  return !isnan(value) && !isinf(value) && value >= 10.0f && value <= 10000.0f;
+  const float magnitude = fabs(value);
+  return !isnan(value) && !isinf(value) &&
+         magnitude >= 0.01f && magnitude <= 10000000.0f;
 }
 
 void printPadded(uint8_t col, uint8_t row, const char* text) {
@@ -258,6 +262,70 @@ void persistCalibrationFactor(float value) {
   EEPROM.commit();
 }
 
+bool readNau7802AverageRaw(
+  uint8_t samplesToRead,
+  unsigned long timeoutMs,
+  int32_t &averageRaw,
+  int32_t &minimumRaw,
+  int32_t &maximumRaw
+) {
+  if (!nau7802Ready || samplesToRead == 0) {
+    return false;
+  }
+
+  int64_t total = 0;
+  uint8_t samplesRead = 0;
+  const unsigned long startedMs = millis();
+
+  while (samplesRead < samplesToRead && millis() - startedMs < timeoutMs) {
+    if (!loadCell.available()) {
+      delay(1);
+      continue;
+    }
+
+    const int32_t raw = loadCell.getReading();
+    lastNau7802RawReading = raw;
+    lastNau7802UpdateMs = millis();
+
+    if (samplesRead == 0) {
+      minimumRaw = raw;
+      maximumRaw = raw;
+    } else {
+      if (raw < minimumRaw) minimumRaw = raw;
+      if (raw > maximumRaw) maximumRaw = raw;
+    }
+
+    total += raw;
+    samplesRead++;
+  }
+
+  if (samplesRead != samplesToRead) {
+    return false;
+  }
+
+  averageRaw = static_cast<int32_t>(total / samplesRead);
+  return true;
+}
+
+bool captureNau7802Reading() {
+  if (!nau7802Ready || !loadCell.available()) {
+    return false;
+  }
+
+  lastNau7802RawReading = loadCell.getReading();
+  lastNau7802UpdateMs = millis();
+  lastSensorWeightGrams =
+    static_cast<float>(lastNau7802RawReading - loadCell.getZeroOffset()) /
+    calibration_factor;
+
+  if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams)) {
+    Serial.println("Invalid NAU7802 reading");
+    return false;
+  }
+
+  return true;
+}
+
 void saveCalibrationFactor(float value) {
   if (!isValidCalibrationFactor(value)) {
     Serial.println("Invalid calibration factor, not saved.");
@@ -265,7 +333,7 @@ void saveCalibrationFactor(float value) {
   }
 
   calibration_factor = value;
-  LoadCell.setCalFactor(calibration_factor);
+  loadCell.setCalibrationFactor(calibration_factor);
   persistCalibrationFactor(calibration_factor);
   Serial.print("Calibration factor saved: ");
   Serial.println(calibration_factor, 6);
@@ -319,7 +387,7 @@ void printCalibrationLearningStatus() {
 }
 
 bool addCalibrationLearningSample(float knownWeightGrams) {
-  if (!hx711Ready || knownWeightGrams <= 0.0f) {
+  if (!nau7802Ready || knownWeightGrams <= 0.0f) {
     Serial.println("Use: cal add 500");
     return false;
   }
@@ -334,43 +402,39 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
 
   stopFruitDetection(true);
 
-  float measuredAverageGrams = 0.0f;
-  float measuredMinGrams = 0.0f;
-  float measuredMaxGrams = 0.0f;
-  uint8_t samplesRead = 0;
-  const unsigned long startedMs = millis();
-  while (samplesRead < CALIBRATION_SAMPLE_READS &&
-         millis() - startedMs < CALIBRATION_SAMPLE_TIMEOUT_MS) {
-    if (!LoadCell.update()) {
-      delay(5);
-      continue;
-    }
-
-    lastHx711UpdateMs = millis();
-    const float sampleGrams = LoadCell.getData();
-    if (isnan(sampleGrams) || isinf(sampleGrams)) {
-      continue;
-    }
-
-    if (samplesRead == 0) {
-      measuredMinGrams = sampleGrams;
-      measuredMaxGrams = sampleGrams;
-    } else {
-      if (sampleGrams < measuredMinGrams) measuredMinGrams = sampleGrams;
-      if (sampleGrams > measuredMaxGrams) measuredMaxGrams = sampleGrams;
-    }
-    measuredAverageGrams += sampleGrams;
-    samplesRead++;
-  }
-
-  if (samplesRead < CALIBRATION_SAMPLE_READS) {
-    Serial.println("Calibration sample ignored: HX711 did not provide enough readings.");
+  int32_t averageRaw = 0;
+  int32_t minimumRaw = 0;
+  int32_t maximumRaw = 0;
+  if (!readNau7802AverageRaw(
+        CALIBRATION_SAMPLE_READS,
+        CALIBRATION_SAMPLE_TIMEOUT_MS,
+        averageRaw,
+        minimumRaw,
+        maximumRaw
+      )) {
+    Serial.println("Calibration sample ignored: NAU7802 did not provide enough readings.");
     resetWeightState();
     return false;
   }
 
-  measuredAverageGrams /= samplesRead;
-  const float measuredSpreadGrams = fabs(measuredMaxGrams - measuredMinGrams);
+  const float rawDelta =
+    static_cast<float>(averageRaw - loadCell.getZeroOffset());
+  if (fabs(rawDelta) < 1.0f) {
+    Serial.println("Calibration sample ignored: no measurable load-cell change.");
+    showMessage("Cal failed", "Check load cell");
+    resetWeightState();
+    return false;
+  }
+
+  const float sampleFactor = rawDelta / knownWeightGrams;
+  if (!isValidCalibrationFactor(sampleFactor)) {
+    Serial.println("Invalid calibration sample ignored.");
+    return false;
+  }
+
+  const float measuredAverageGrams = rawDelta / calibration_factor;
+  const float measuredSpreadGrams =
+    static_cast<float>(maximumRaw - minimumRaw) / fabs(sampleFactor);
   const float allowedSpreadGrams =
     knownWeightGrams * 0.01f > 2.0f ? knownWeightGrams * 0.01f : 2.0f;
   if (measuredSpreadGrams > allowedSpreadGrams) {
@@ -384,13 +448,6 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
     return false;
   }
 
-  const float sampleFactor =
-    (fabs(measuredAverageGrams) * calibration_factor) / knownWeightGrams;
-  if (!isValidCalibrationFactor(sampleFactor)) {
-    Serial.println("Invalid calibration sample ignored.");
-    return false;
-  }
-
   calibrationLearningWeightedFactorSum += sampleFactor * knownWeightGrams;
   calibrationLearningWeightSumGrams += knownWeightGrams;
   calibrationLearningSampleCount++;
@@ -398,7 +455,7 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
     calibrationLearningWeightedFactorSum / calibrationLearningWeightSumGrams;
 
   calibration_factor = calibrationLearningCandidateFactor;
-  LoadCell.setCalFactor(calibration_factor);
+  loadCell.setCalibrationFactor(calibration_factor);
   resetWeightState();
 
   Serial.print("Calibration sample ");
@@ -439,7 +496,7 @@ void cancelCalibrationLearning() {
   }
 
   calibration_factor = calibrationLearningSavedFactor;
-  LoadCell.setCalFactor(calibration_factor);
+  loadCell.setCalibrationFactor(calibration_factor);
   clearCalibrationLearningSession();
   resetWeightState();
   Serial.print("Calibration learning cancelled. Restored factor: ");
@@ -493,14 +550,13 @@ float activeSensorWeightGrams() {
 }
 
 float readWeightGrams() {
-  if (!hx711Ready) {
+  if (!nau7802Ready) {
     return currentWeightGrams;
   }
 
-  float weight = LoadCell.getData();
-  lastSensorWeightGrams = weight;
+  float weight = lastSensorWeightGrams;
   if (isnan(weight) || isinf(weight)) {
-    Serial.println("Invalid HX711 reading");
+    Serial.println("Invalid NAU7802 reading");
     return currentWeightGrams;
   }
 
@@ -533,6 +589,8 @@ void printScaleDiagnostics() {
   const unsigned long nowMs = millis();
   Serial.print("SCALE status=");
   Serial.print(scaleStatusText());
+  Serial.print(" raw=");
+  Serial.print(lastNau7802RawReading);
   Serial.print(" sensor=");
   Serial.print(lastSensorWeightGrams, 2);
   Serial.print("g processed=");
@@ -566,8 +624,8 @@ void printScaleDiagnostics() {
   Serial.print(digitalRead(BTN_SUCCESS));
   Serial.print(" btnCancel=");
   Serial.print(digitalRead(BTN_CANCEL));
-  Serial.print(" hxAgeMs=");
-  Serial.println(nowMs - lastHx711UpdateMs);
+  Serial.print(" nauAgeMs=");
+  Serial.println(nowMs - lastNau7802UpdateMs);
 }
 
 void showMessage(const char* line1, const char* line2, unsigned long nowMs) {
@@ -578,31 +636,38 @@ void showMessage(const char* line1, const char* line2, unsigned long nowMs) {
   messageUntilMs = nowMs + MESSAGE_DISPLAY_MS;
 }
 
-void tareScale(const char* reason) {
-  if (!hx711Ready) {
+bool tareScale(const char* reason) {
+  if (!nau7802Ready) {
     showMessage("Scale not ready");
-    return;
+    return false;
   }
 
   Serial.println(reason);
   showMessage("Taring scale...");
-  LoadCell.tareNoDelay();
-  unsigned long tareStartedMs = millis();
-  bool tareComplete = false;
-  while (!tareComplete && millis() - tareStartedMs < TARE_TIMEOUT_MS) {
-    LoadCell.update();
-    tareComplete = LoadCell.getTareStatus();
-  }
-
-  if (!tareComplete) {
+  int32_t zeroOffset = 0;
+  int32_t minimumRaw = 0;
+  int32_t maximumRaw = 0;
+  if (!readNau7802AverageRaw(
+        TARE_SAMPLE_READS,
+        TARE_TIMEOUT_MS,
+        zeroOffset,
+        minimumRaw,
+        maximumRaw
+      )) {
     showMessage("Tare failed", "Check scale");
     Serial.println("Tare timeout - check scale stability and wiring");
-    return;
+    return false;
   }
 
+  loadCell.setZeroOffset(zeroOffset);
+  Serial.print("NAU7802 zero offset: ");
+  Serial.print(zeroOffset);
+  Serial.print(" raw spread: ");
+  Serial.println(maximumRaw - minimumRaw);
   resetWeightState();
   showMessage("Scale zeroed");
   Serial.println("Tare complete");
+  return true;
 }
 
 SaleRecord confirmSale(const char* reason, const char* source) {
@@ -685,7 +750,7 @@ void cancelSale(const char* reason) {
 }
 
 void updateLockedWeight() {
-  if (!hx711Ready || !newScaleData) return;
+  if (!nau7802Ready || !newScaleData) return;
   newScaleData = false;
 
   float liveWeightGrams = readWeightGrams();
@@ -849,42 +914,37 @@ void setupScale() {
   if (!isValidCalibrationFactor(calibration_factor)) {
     calibration_factor = DEFAULT_CALIBRATION_FACTOR;
     persistCalibrationFactor(calibration_factor);
-  } else if (fabs(calibration_factor - OLD_DEFAULT_CALIBRATION_FACTOR) < 0.0001) {
-    calibration_factor = DEFAULT_CALIBRATION_FACTOR;
-    persistCalibrationFactor(calibration_factor);
-  } else if (fabs(calibration_factor - PREVIOUS_CALIBRATION_FACTOR) < 0.0001) {
-    calibration_factor = DEFAULT_CALIBRATION_FACTOR;
-    persistCalibrationFactor(calibration_factor);
   }
 
-  Serial.println("Starting HX711...");
-  Serial.print("DOUT GPIO: ");
-  Serial.println(HX_DOUT);
-  Serial.print("SCK GPIO: ");
-  Serial.println(HX_SCK);
+  Serial.println("Starting NAU7802...");
+  Serial.print("I2C SDA GPIO: ");
+  Serial.println(I2C_SDA);
+  Serial.print("I2C SCL GPIO: ");
+  Serial.println(I2C_SCL);
   Serial.print("Calibration factor: ");
   Serial.println(calibration_factor, 6);
 
-  LoadCell.begin();
-  unsigned long stabilizingtime = 2000;
-  boolean tare = true;
-  LoadCell.start(stabilizingtime, tare);
-
-  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
-    hx711Ready = false;
-    Serial.println("HX711 timeout - check wiring");
+  if (!loadCell.begin(Wire)) {
+    nau7802Ready = false;
+    Serial.println("NAU7802 not detected at I2C address 0x2A");
     lcd.clear();
-    lcd.print("HX711 timeout");
+    lcd.print("NAU7802 missing");
     lcd.setCursor(0, 1);
-    lcd.print("Check wiring");
+    lcd.print("Check SDA/SCL/GND");
     return;
   }
 
-  LoadCell.setCalFactor(calibration_factor);
-  hx711Ready = true;
+  loadCell.setCalibrationFactor(calibration_factor);
+  nau7802Ready = true;
   currentWeightGrams = 0.0;
-  lastHx711UpdateMs = millis();
-  Serial.println("Scale ready");
+  lastNau7802UpdateMs = millis();
+
+  if (!tareScale("Initial NAU7802 tare")) {
+    nau7802Ready = false;
+    return;
+  }
+
+  Serial.println("NAU7802 scale ready at 80 SPS, gain 128");
   printScaleHelp();
 }
 
@@ -1336,39 +1396,39 @@ void updateDisplay() {
   float billableWeightGrams = currentWeightGrams;
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = calculatePrice(billableWeightGrams);
-  char statusCode = 'Z';
-  if (cancelledObjectActive) {
-    statusCode = 'Z';
-  } else if (weightLocked) {
-    statusCode = 'L';
-  } else if (objectPresent) {
-    statusCode = 'W';
+  const char* statusText = "Idle";
+  if (weightLocked && !cancelledObjectActive) {
+    statusText = "Locked";
+  } else if (objectPresent && !cancelledObjectActive) {
+    statusText = "Weighing";
   }
 
   char line[21];
   char weightText[9];
   formatDisplayWeight(billableWeightGrams, weightText, sizeof(weightText));
 
-  snprintf(line, sizeof(line), "Fruit:%-13.13s", currentFruitType);
+  snprintf(line, sizeof(line), "Fruit: %-13.13s", currentFruitType);
   printPadded(0, 0, line);
 
   if (hasFruitPrice(currentFruitType)) {
-    snprintf(line, sizeof(line), "Wt:%-7s P:%6.2f", weightText, price);
+    snprintf(line, sizeof(line), "W: %s P:%.2f", weightText, price);
   } else {
-    snprintf(line, sizeof(line), "Wt:%-7s P: --", weightText);
+    snprintf(line, sizeof(line), "W: %s P:--", weightText);
   }
   printPadded(0, 1, line);
 
+  snprintf(line, sizeof(line), "Status: %s", statusText);
+  printPadded(0, 2, line);
+
   if (rtcReady) {
     DateTime now = rtc.now();
-    snprintf(line, sizeof(line), "Stat:%c %02d:%02d", statusCode, now.hour(), now.minute());
-    printPadded(0, 2, line);
-    snprintf(line, sizeof(line), "%02d/%02d/%04d",
-             now.month(), now.day(), now.year());
+    const char* meridiem = now.hour() >= 12 ? "PM" : "AM";
+    uint8_t displayHour = now.hour() % 12;
+    if (displayHour == 0) displayHour = 12;
+    snprintf(line, sizeof(line), "%02d/%02d/%04d %u:%02d %s",
+             now.month(), now.day(), now.year(), displayHour, now.minute(), meridiem);
   } else {
-    snprintf(line, sizeof(line), "Stat:%c No RTC", statusCode);
-    printPadded(0, 2, line);
-    snprintf(line, sizeof(line), "RTC not detected");
+    snprintf(line, sizeof(line), "Date/time: No RTC");
   }
   printPadded(0, 3, line);
 }
@@ -1757,7 +1817,9 @@ void handleButtons() {
 
   if (cancelPressed && nowMs - lastCancelActionMs >= BUTTON_COOLDOWN_MS) {
     lastCancelActionMs = nowMs;
-    cancelSale("Cancel button pressed");
+    if (tareScale("Cancel button tare")) {
+      beepBuzzer(2);
+    }
   }
 }
 
@@ -1872,16 +1934,15 @@ void setup() {
   setupScale();
   maintainPriceUpdates();
 
-  showMessage(hx711Ready ? "Ready!" : "Scale not ready");
+  showMessage(nau7802Ready ? "Ready!" : "Scale not ready");
 }
 
 void loop() {
-  if (hx711Ready && LoadCell.update()) {
-    lastHx711UpdateMs = millis();
+  if (captureNau7802Reading()) {
     newScaleData = true;
   }
 
-  if (hx711Ready) {
+  if (nau7802Ready) {
     updateLockedWeight();
   }
 
@@ -1893,8 +1954,8 @@ void loop() {
 
   if (millis() - lastSerialDiagnosticMs >= SERIAL_DIAGNOSTIC_INTERVAL_MS) {
     printScaleDiagnostics();
-    if (hx711Ready && millis() - lastHx711UpdateMs > 2000) {
-      Serial.println("HX711 not updating - check DOUT/SCK wiring and power.");
+    if (nau7802Ready && millis() - lastNau7802UpdateMs > 2000) {
+      Serial.println("NAU7802 not updating - check SDA/SCL, common GND, and power.");
     }
     lastSerialDiagnosticMs = millis();
   }
