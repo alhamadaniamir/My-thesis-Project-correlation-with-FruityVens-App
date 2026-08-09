@@ -29,6 +29,7 @@ uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint8_t CALIBRATION_SAMPLE_READS = 8;
 constexpr uint8_t TARE_SAMPLE_READS = 32;
 constexpr unsigned long CALIBRATION_SAMPLE_TIMEOUT_MS = 3000;
+constexpr uint32_t CALIBRATION_EEPROM_MAGIC = 0x4E415531UL;  // "NAU1"
 
 struct SaleRecord {
   unsigned long id;
@@ -64,6 +65,7 @@ float calibration_factor = DEFAULT_CALIBRATION_FACTOR;
 bool calibrationLearningActive = false;
 unsigned int calibrationLearningSampleCount = 0;
 float calibrationLearningSavedFactor = 0.0;
+bool calibrationLearningSavedReady = false;
 float calibrationLearningWeightedFactorSum = 0.0;
 float calibrationLearningWeightSumGrams = 0.0;
 float calibrationLearningCandidateFactor = 0.0;
@@ -82,14 +84,13 @@ float lastSensorWeightGrams = 0.0;
 float lastProcessedWeightGrams = 0.0;
 float lastReturnedWeightGrams = 0.0;
 float lastFilterAlpha = 0.0;
-float activeWeightDirection = 1.0;
 int32_t lastNau7802RawReading = 0;
 bool nau7802Ready = false;
+bool calibrationReady = false;
 bool rtcReady = false;
 bool weightLocked = false;
 bool objectPresent = false;
 bool newScaleData = false;
-bool activeWeightDirectionKnown = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
 uint8_t lockMatchCount = 0;
@@ -144,6 +145,8 @@ float calculatePriceForFruit(const char* fruitType, float weightGrams) {
 }
 
 const char* scaleStatusText() {
+  if (calibrationLearningActive) return "calibrating";
+  if (!calibrationReady) return "uncalibrated";
   if (cancelledObjectActive) return "cancelled";
   if (weightLocked) return "locked";
   if (objectPresent) return "weighing";
@@ -239,8 +242,6 @@ void resetWeightState() {
   lastProcessedWeightGrams = 0.0;
   lastReturnedWeightGrams = 0.0;
   lastFilterAlpha = 0.0;
-  activeWeightDirection = 1.0;
-  activeWeightDirectionKnown = false;
   objectDetectCount = 0;
   objectRemoveCount = 0;
   lockMatchCount = 0;
@@ -257,8 +258,10 @@ void startObjectRedetectCooldown() {
   objectRedetectCooldownUntilMs = millis() + OBJECT_REDETECT_COOLDOWN_MS;
 }
 
-void persistCalibrationFactor(float value) {
+void persistCalibrationFactor(float value, bool ready) {
   EEPROM.put(calVal_eepromAddress, value);
+  const uint32_t marker = ready ? CALIBRATION_EEPROM_MAGIC : 0;
+  EEPROM.put(calVal_eepromAddress + sizeof(value), marker);
   EEPROM.commit();
 }
 
@@ -314,9 +317,13 @@ bool captureNau7802Reading() {
 
   lastNau7802RawReading = loadCell.getReading();
   lastNau7802UpdateMs = millis();
-  lastSensorWeightGrams =
-    static_cast<float>(lastNau7802RawReading - loadCell.getZeroOffset()) /
-    calibration_factor;
+  if (calibrationReady) {
+    lastSensorWeightGrams =
+      static_cast<float>(lastNau7802RawReading - loadCell.getZeroOffset()) /
+      calibration_factor;
+  } else {
+    lastSensorWeightGrams = 0.0f;
+  }
 
   if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams)) {
     Serial.println("Invalid NAU7802 reading");
@@ -326,23 +333,27 @@ bool captureNau7802Reading() {
   return true;
 }
 
-void saveCalibrationFactor(float value) {
+void saveCalibrationFactor(float value, bool ready = true) {
   if (!isValidCalibrationFactor(value)) {
     Serial.println("Invalid calibration factor, not saved.");
     return;
   }
 
   calibration_factor = value;
+  calibrationReady = ready;
   loadCell.setCalibrationFactor(calibration_factor);
-  persistCalibrationFactor(calibration_factor);
+  persistCalibrationFactor(calibration_factor, calibrationReady);
   Serial.print("Calibration factor saved: ");
-  Serial.println(calibration_factor, 6);
+  Serial.print(calibration_factor, 6);
+  Serial.print(" ready=");
+  Serial.println(calibrationReady ? "yes" : "no");
 }
 
 void clearCalibrationLearningSession() {
   calibrationLearningActive = false;
   calibrationLearningSampleCount = 0;
   calibrationLearningSavedFactor = 0.0;
+  calibrationLearningSavedReady = false;
   calibrationLearningWeightedFactorSum = 0.0;
   calibrationLearningWeightSumGrams = 0.0;
   calibrationLearningCandidateFactor = 0.0;
@@ -352,9 +363,12 @@ void beginCalibrationLearning() {
   calibrationLearningActive = true;
   calibrationLearningSampleCount = 0;
   calibrationLearningSavedFactor = calibration_factor;
+  calibrationLearningSavedReady = calibrationReady;
   calibrationLearningWeightedFactorSum = 0.0;
   calibrationLearningWeightSumGrams = 0.0;
   calibrationLearningCandidateFactor = calibration_factor;
+
+  resetWeightState();
 
   Serial.println("Calibration learning started.");
   Serial.println("Use: t, place known weight, cal add 500");
@@ -376,6 +390,8 @@ void printCalibrationLearningStatus() {
   Serial.print(calibrationLearningSampleCount);
   Serial.print(" current=");
   Serial.print(calibration_factor, 6);
+  Serial.print(" ready=");
+  Serial.print(calibrationReady ? "yes" : "no");
   Serial.print(" candidate=");
   if (hasCalibrationLearningSamples()) {
     Serial.print(calibrationLearningCandidateFactor, 6);
@@ -419,6 +435,16 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
 
   const float rawDelta =
     static_cast<float>(averageRaw - loadCell.getZeroOffset());
+  Serial.print("Calibration raw zero=");
+  Serial.print(loadCell.getZeroOffset());
+  Serial.print(" average=");
+  Serial.print(averageRaw);
+  Serial.print(" delta=");
+  Serial.print(rawDelta, 2);
+  Serial.print(" min=");
+  Serial.print(minimumRaw);
+  Serial.print(" max=");
+  Serial.println(maximumRaw);
   if (fabs(rawDelta) < 1.0f) {
     Serial.println("Calibration sample ignored: no measurable load-cell change.");
     showMessage("Cal failed", "Check load cell");
@@ -496,6 +522,7 @@ void cancelCalibrationLearning() {
   }
 
   calibration_factor = calibrationLearningSavedFactor;
+  calibrationReady = calibrationLearningSavedReady;
   loadCell.setCalibrationFactor(calibration_factor);
   clearCalibrationLearningSession();
   resetWeightState();
@@ -509,7 +536,7 @@ void printScaleHelp() {
   Serial.println("  t = tare / zero");
   Serial.println("  + or a = increase calibration factor");
   Serial.println("  - or z = decrease calibration factor");
-  Serial.println("  r = reset calibration factor");
+  Serial.println("  r = clear saved calibration");
   Serial.println("  cal start = start calibration learning");
   Serial.println("  cal add 500 = add known 500g sample, not saved yet");
   Serial.println("  c 500 = same as cal add 500");
@@ -521,28 +548,12 @@ void printScaleHelp() {
   Serial.println("Buttons: released=1, pressed=0");
 }
 
-void rememberActiveWeightDirection() {
-  if (activeWeightDirectionKnown) {
-    return;
-  }
-
-  if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams) ||
-      fabs(lastSensorWeightGrams) < OBJECT_DETECT_GRAMS) {
-    return;
-  }
-
-  activeWeightDirection = lastSensorWeightGrams < 0.0f ? -1.0f : 1.0f;
-  activeWeightDirectionKnown = true;
-}
-
-float activeSensorWeightGrams() {
+float positiveSensorWeightGrams() {
   if (isnan(lastSensorWeightGrams) || isinf(lastSensorWeightGrams)) {
     return currentWeightGrams;
   }
 
-  float weight = activeWeightDirectionKnown
-    ? lastSensorWeightGrams * activeWeightDirection
-    : fabs(lastSensorWeightGrams);
+  const float weight = lastSensorWeightGrams;
   if (weight < NOISE_FLOOR_GRAMS) {
     return 0.0f;
   }
@@ -550,7 +561,7 @@ float activeSensorWeightGrams() {
 }
 
 float readWeightGrams() {
-  if (!nau7802Ready) {
+  if (!nau7802Ready || !calibrationReady) {
     return currentWeightGrams;
   }
 
@@ -560,7 +571,7 @@ float readWeightGrams() {
     return currentWeightGrams;
   }
 
-  weight = fabs(weight);
+  if (weight < 0.0f) weight = 0.0f;
   if (weight < NOISE_FLOOR_GRAMS) weight = 0;
   lastProcessedWeightGrams = weight;
 
@@ -591,6 +602,10 @@ void printScaleDiagnostics() {
   Serial.print(scaleStatusText());
   Serial.print(" raw=");
   Serial.print(lastNau7802RawReading);
+  Serial.print(" zero=");
+  Serial.print(loadCell.getZeroOffset());
+  Serial.print(" rawDelta=");
+  Serial.print(lastNau7802RawReading - loadCell.getZeroOffset());
   Serial.print(" sensor=");
   Serial.print(lastSensorWeightGrams, 2);
   Serial.print("g processed=");
@@ -620,6 +635,8 @@ void printScaleDiagnostics() {
   Serial.print(currentFruitType);
   Serial.print(" cal=");
   Serial.print(calibration_factor, 6);
+  Serial.print(" calibrated=");
+  Serial.print(calibrationReady ? "yes" : "no");
   Serial.print(" btnOK=");
   Serial.print(digitalRead(BTN_SUCCESS));
   Serial.print(" btnCancel=");
@@ -671,6 +688,12 @@ bool tareScale(const char* reason) {
 }
 
 SaleRecord confirmSale(const char* reason, const char* source) {
+  if (!calibrationReady) {
+    showMessage("Scale uncalibrated", "Run calibration");
+    beepBuzzer(2);
+    return SaleRecord{};
+  }
+
   if (calibrationLearningActive) {
     showMessage("Calibrating", "No sale saved");
     beepBuzzer(2);
@@ -753,11 +776,16 @@ void updateLockedWeight() {
   if (!nau7802Ready || !newScaleData) return;
   newScaleData = false;
 
-  float liveWeightGrams = readWeightGrams();
-  if (liveWeightGrams >= OBJECT_DETECT_GRAMS) {
-    rememberActiveWeightDirection();
+  if (!calibrationReady || calibrationLearningActive) {
+    currentWeightGrams = 0.0f;
+    lastProcessedWeightGrams = 0.0f;
+    filteredWeightGrams = 0.0f;
+    lastReturnedWeightGrams = 0.0f;
+    return;
   }
-  const float liveSensorWeightGrams = activeSensorWeightGrams();
+
+  float liveWeightGrams = readWeightGrams();
+  const float liveSensorWeightGrams = positiveSensorWeightGrams();
 
   if (weightLocked) {
     currentWeightGrams = cancelledObjectActive ? 0.0f : lockedWeightGrams;
@@ -834,7 +862,7 @@ void updateLockedWeight() {
   }
 
   if (liveWeightGrams < OBJECT_DETECT_GRAMS ||
-      (activeWeightDirectionKnown && liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS)) {
+      liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
     stopFruitDetection(true);
     objectPresent = false;
     cameraScanAttemptedForCurrentObject = false;
@@ -847,8 +875,6 @@ void updateLockedWeight() {
     lockWeightSampleCount = 0;
     lastLockCandidateGrams = 0.0;
     lockWeightSumGrams = 0.0;
-    activeWeightDirection = 1.0;
-    activeWeightDirectionKnown = false;
     objectPresentStartedMs = 0;
     return;
   }
@@ -911,9 +937,20 @@ void setupScale() {
 
   EEPROM.begin(512);
   EEPROM.get(calVal_eepromAddress, calibration_factor);
+  uint32_t calibrationMarker = 0;
+  EEPROM.get(calVal_eepromAddress + sizeof(calibration_factor), calibrationMarker);
   if (!isValidCalibrationFactor(calibration_factor)) {
     calibration_factor = DEFAULT_CALIBRATION_FACTOR;
-    persistCalibrationFactor(calibration_factor);
+    calibrationReady = false;
+    persistCalibrationFactor(calibration_factor, false);
+  } else {
+    calibrationReady = calibrationMarker == CALIBRATION_EEPROM_MAGIC;
+    if (!calibrationReady &&
+        fabs(calibration_factor - DEFAULT_CALIBRATION_FACTOR) > 0.000001f) {
+      calibrationReady = true;
+      persistCalibrationFactor(calibration_factor, true);
+      Serial.println("Migrated existing NAU7802 calibration factor.");
+    }
   }
 
   Serial.println("Starting NAU7802...");
@@ -923,6 +960,8 @@ void setupScale() {
   Serial.println(I2C_SCL);
   Serial.print("Calibration factor: ");
   Serial.println(calibration_factor, 6);
+  Serial.print("Calibration ready: ");
+  Serial.println(calibrationReady ? "yes" : "no");
 
   if (!loadCell.begin(Wire)) {
     nau7802Ready = false;
@@ -931,6 +970,17 @@ void setupScale() {
     lcd.print("NAU7802 missing");
     lcd.setCursor(0, 1);
     lcd.print("Check SDA/SCL/GND");
+    return;
+  }
+
+  if (!loadCell.setChannel(NAU7802_CHANNEL_1) ||
+      !loadCell.setGain(NAU7802_GAIN_128) ||
+      !loadCell.setSampleRate(NAU7802_SPS_10) ||
+      !loadCell.calibrateAFE()) {
+    nau7802Ready = false;
+    Serial.println("NAU7802 configuration or AFE calibration failed");
+    lcd.clear();
+    lcd.print("NAU7802 setup fail");
     return;
   }
 
@@ -944,7 +994,7 @@ void setupScale() {
     return;
   }
 
-  Serial.println("NAU7802 scale ready at 80 SPS, gain 128");
+  Serial.println("NAU7802 scale ready on channel 1 at 10 SPS, gain 128");
   printScaleHelp();
 }
 
@@ -1397,7 +1447,11 @@ void updateDisplay() {
   if (billableWeightGrams < 0) billableWeightGrams = 0;
   float price = calculatePrice(billableWeightGrams);
   const char* statusText = "Idle";
-  if (weightLocked && !cancelledObjectActive) {
+  if (calibrationLearningActive) {
+    statusText = "Calibrating";
+  } else if (!calibrationReady) {
+    statusText = "Cal needed";
+  } else if (weightLocked && !cancelledObjectActive) {
     statusText = "Locked";
   } else if (objectPresent && !cancelledObjectActive) {
     statusText = "Weighing";
@@ -1849,7 +1903,9 @@ void processSerialCommand() {
 
   if (command == "r" || command == "R") {
     clearCalibrationLearningSession();
-    saveCalibrationFactor(DEFAULT_CALIBRATION_FACTOR);
+    saveCalibrationFactor(DEFAULT_CALIBRATION_FACTOR, false);
+    resetWeightState();
+    showMessage("Calibration reset", "Tare and calibrate");
     return;
   }
 
@@ -1934,7 +1990,13 @@ void setup() {
   setupScale();
   maintainPriceUpdates();
 
-  showMessage(nau7802Ready ? "Ready!" : "Scale not ready");
+  if (!nau7802Ready) {
+    showMessage("Scale not ready");
+  } else if (!calibrationReady) {
+    showMessage("Calibration needed", "Tare, then c 500");
+  } else {
+    showMessage("Ready!");
+  }
 }
 
 void loop() {
