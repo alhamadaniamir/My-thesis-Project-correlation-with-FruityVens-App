@@ -41,7 +41,7 @@ async fn auth(req: Request<axum::body::Body>, next: Next) -> Result<Response, (S
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    if provided != expected.as_str() {
+    if expected.is_empty() || provided != expected.as_str() {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
     }
     Ok(next.run(req).await)
@@ -61,7 +61,7 @@ async fn identify(
 
     let (mut ws, _) = connect_async(&url)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ws connect failed: {e}")))?;
+        .map_err(|e| upstream_error("connect", e, &api_key))?;
 
     let setup = json!({
         "setup": {
@@ -72,15 +72,15 @@ async fn identify(
     });
     ws.send(Message::Text(setup.to_string()))
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ws send setup: {e}")))?;
+        .map_err(|e| upstream_error("send setup", e, &api_key))?;
 
     // Wait for setupComplete
     loop {
         let msg = ws
             .next()
             .await
-            .ok_or((StatusCode::BAD_GATEWAY, "ws closed before setupComplete".to_string()))?
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ws recv: {e}")))?;
+            .ok_or((StatusCode::BAD_GATEWAY, "upstream closed before setup".to_string()))?
+            .map_err(|e| upstream_error("receive", e, &api_key))?;
         if let Some(text) = msg_text(&msg) {
             let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             if v.get("setupComplete").is_some() {
@@ -104,15 +104,15 @@ async fn identify(
     });
     ws.send(Message::Text(client_content.to_string()))
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ws send content: {e}")))?;
+        .map_err(|e| upstream_error("send content", e, &api_key))?;
 
     let mut out = String::new();
     loop {
         let msg = ws
             .next()
             .await
-            .ok_or((StatusCode::BAD_GATEWAY, "ws closed before turnComplete".to_string()))?
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ws recv: {e}")))?;
+            .ok_or((StatusCode::BAD_GATEWAY, "upstream closed before reply".to_string()))?
+            .map_err(|e| upstream_error("receive", e, &api_key))?;
         let Some(text) = msg_text(&msg) else { continue };
         let v: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
@@ -190,6 +190,19 @@ fn canonical_fruit(raw: &str) -> &'static str {
     best.map(|(_, label)| label).unwrap_or("Unknown")
 }
 
+fn upstream_error(
+    stage: &str,
+    error: impl std::fmt::Display,
+    api_key: &str,
+) -> (StatusCode, String) {
+    let mut detail = error.to_string();
+    if !api_key.is_empty() {
+        detail = detail.replace(api_key, "<redacted>");
+    }
+    eprintln!("gemini {stage} failed: {detail}");
+    (StatusCode::BAD_GATEWAY, format!("upstream {stage} failed"))
+}
+
 fn msg_text(msg: &Message) -> Option<String> {
     match msg {
         Message::Text(t) => Some(t.clone()),
@@ -203,8 +216,11 @@ async fn main() -> Result<(), Error> {
     let _ = dotenvy::dotenv();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    if let Ok(t) = env::var("AUTH_TOKEN") {
-        let _ = AUTH_TOKEN.set(t);
+    match env::var("AUTH_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => {
+            let _ = AUTH_TOKEN.set(t);
+        }
+        _ => eprintln!("AUTH_TOKEN missing or empty; /api/identify will reject every request"),
     }
 
     let cors_origin = env::var("CORS_ORIGIN").unwrap_or_else(|_| "*".to_string());
