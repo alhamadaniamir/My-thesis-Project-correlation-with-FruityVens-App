@@ -15,7 +15,6 @@ struct FruitAlias {
 
 static const FruitAlias kAllowedFruitAliases[] = {
   {"Apple", "Apple"},
-  {"Mango", "Mango"},
   {"Mango Carabao", "Mango Carabao"},
   {"Carabao Mango", "Mango Carabao"},
   {"Indian Mango", "Indian Mango"},

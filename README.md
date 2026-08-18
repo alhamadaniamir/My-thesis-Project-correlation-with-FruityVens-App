@@ -2,7 +2,7 @@
 
 **Computer Vision-Based Fruit Detection Automated IoT Weighing Scale with AI-Driven Sales Forecasting and Data Analytics**
 
-This folder contains the firmware for the three ESP32 boards that make up the smart fruit weighing scale. The boards talk to each other over **ESP-NOW** (router-free peer-to-peer) and to the cloud over **WiFi** (Google Gemini via the Vercel backend, and Firebase Realtime Database).
+This repository contains the firmware for the three ESP32 boards that make up the smart fruit weighing scale, plus the serverless backend they call for fruit identification. The boards talk to each other over **ESP-NOW** (router-free peer-to-peer) and to the cloud over **WiFi** (Google Gemini via the Vercel backend, and Firebase Realtime Database).
 
 ## Boards & Sketches
 
@@ -11,6 +11,8 @@ This folder contains the firmware for the three ESP32 boards that make up the sm
 | [`AutomatedWeighing/`](AutomatedWeighing) | ESP32 Dev Module | Main scale: NAU7802 load-cell ADC, LCD I2C, buttons, buzzer, RTC. Detects weight, requests fruit ID, displays result, records sales. |
 | [`ESP32CamSender/`](ESP32CamSender) | ESP32-CAM (AI Thinker) | Camera: captures JPEG, calls the Vercel/Gemini backend, broadcasts the fruit name. |
 | [`ESP32Receiver/`](ESP32Receiver) | ESP32 Dev Module | Firebase worker (optional): uploads sales to Firebase and relays price updates. |
+
+[`Backend/`](Backend) is not a sketch. It is the Rust serverless function deployed on Vercel that receives the JPEG from the camera, asks Gemini what the fruit is, and answers with a single label. See [`Backend/README.md`](Backend/README.md).
 
 ## Master / Slave Roles
 
@@ -53,10 +55,10 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
                     ▲                                          │ capture JPEG
                     │                                          ▼
                     │                                 [Vercel Backend] ─► [Gemini AI]
-                    │                                          │ {"fruit":"Mango"}
+                    │                                          │ {"fruit":"Mango Carabao"}
                     │◄──────ESP-NOW DetectionPacket────────────┘
                     │
-                    ├─► [LCD I2C 20x4]  Fruit: Mango / Wt: 350g  P: 24.50
+                    ├─► [LCD I2C 20x4]  Fruit: Mango Carabao / Wt: 350g  P: 24.50
                     │
                     └──ESP-NOW SaleSync──► [ESP32Receiver] ─► [Firebase RTDB]
                     ◄──ESP-NOW PriceUpdate──┘ (price sync)
@@ -65,7 +67,7 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
 1. **Weight detected** — `AutomatedWeighing` filters the NAU7802 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (9 g).
 2. **Detection requested** — after `CAMERA_START_DELAY_MS` (1 s) it broadcasts a `"START"` command; the LCD shows `Fruit: Identifying`.
 3. **Image captured** — `ESP32CamSender` snaps the cropped ROI as a JPEG.
-4. **Fruit identified** — the JPEG is POSTed to the Vercel backend, which asks Gemini and returns `{"fruit":"Mango"}`.
+4. **Fruit identified** — the JPEG is POSTed to the Vercel backend, which asks Gemini and returns one allowed label, for example `{"fruit":"Mango Carabao"}`. A mango is always reported as a variety (`Mango Carabao`, `Indian Mango`, `Apple Mango`); an unclear fruit comes back as `Unknown`.
 5. **Result broadcast** — the cam normalizes the name and sends a `DetectionPacket` back over ESP-NOW.
 6. **Display** — `AutomatedWeighing` shows the fruit, weight, computed price (`weight_kg × price/kg`), status, and time on the LCD.
 7. **Sale & sync** — pressing the green button records a sale; it is uploaded to Firebase (directly or via the `ESP32Receiver` worker). Prices set in the cloud flow back as `PriceUpdatePacket`s.
@@ -186,5 +188,5 @@ After installing the NAU7802, calibrate it before recording sales:
 
 ## Related
 
-- **Backend**: [fruit-vens-backend](https://github.com/adam-ctrlc/fruit-vens-backend) — Rust serverless function on Vercel that bridges the camera to Google Gemini.
+- **Backend**: [`Backend/`](Backend), mirrored at [fruit-vens-backend](https://github.com/adam-ctrlc/fruit-vens-backend) — Rust serverless function on Vercel that bridges the camera to Google Gemini.
 - **Web demo**: `index.html` — a browser drag-and-drop tester for the same `/api/identify` endpoint.
