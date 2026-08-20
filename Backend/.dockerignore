@@ -1,0 +1,5 @@
+target
+.git
+.vercel
+.env
+.env.local

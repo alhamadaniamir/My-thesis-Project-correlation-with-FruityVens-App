@@ -1,7 +1,21 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "regions": ["sin1"],
+  "regions": [
+    "sin1"
+  ],
+  "services": {
+    "api": {
+      "runtime": "container",
+      "root": "./",
+      "entrypoint": "Dockerfile.vercel"
+    }
+  },
   "rewrites": [
-    { "source": "/api/identify", "destination": "/api/identify" }
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "api"
+      }
+    }
   ]
 }
