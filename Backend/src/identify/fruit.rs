@@ -30,6 +30,23 @@ const FRUIT_ALIASES: &[(&str, &str)] = &[
     ("mandarin", "Orange"),
     ("tangerine", "Orange"),
     ("clementine", "Orange"),
+    ("papaya", "Papaya"),
+    ("calamansi", "Calamansi"),
+    ("kalamansi", "Calamansi"),
+    ("calamondin", "Calamansi"),
+    ("rambutan", "Rambutan"),
+    ("lanzones", "Lanzones"),
+    ("lansones", "Lanzones"),
+    ("langsat", "Lanzones"),
+    ("guyabano", "Guyabano"),
+    ("guanabana", "Guyabano"),
+    ("soursop", "Guyabano"),
+    ("strawberries", "Strawberries"),
+    ("strawberry", "Strawberries"),
+    ("melon", "Melon"),
+    ("cantaloupe", "Melon"),
+    ("honeydew", "Melon"),
+    ("muskmelon", "Melon"),
 ];
 
 pub fn canonical_fruit(raw: &str) -> &'static str {
@@ -78,6 +95,21 @@ mod tests {
     #[test]
     fn empty_transcript_is_unknown() {
         assert_eq!(canonical_fruit(""), "Unknown");
+    }
+
+    #[test]
+    fn watermelon_beats_the_melon_substring() {
+        assert_eq!(canonical_fruit("Watermelon"), "Watermelon");
+    }
+
+    #[test]
+    fn plain_melon_stays_melon() {
+        assert_eq!(canonical_fruit("Cantaloupe"), "Melon");
+    }
+
+    #[test]
+    fn strawberry_is_pluralized_to_the_price_table_key() {
+        assert_eq!(canonical_fruit("Strawberry"), "Strawberries");
     }
 
     #[test]

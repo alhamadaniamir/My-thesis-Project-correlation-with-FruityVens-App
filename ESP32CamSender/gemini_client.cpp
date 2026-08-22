@@ -38,6 +38,23 @@ static const FruitAlias kAllowedFruitAliases[] = {
   {"Orange", "Orange"},
   {"Mandarin", "Orange"},
   {"Mandarine", "Orange"},
+  {"Papaya", "Papaya"},
+  {"Calamansi", "Calamansi"},
+  {"Kalamansi", "Calamansi"},
+  {"Calamondin", "Calamansi"},
+  {"Rambutan", "Rambutan"},
+  {"Lanzones", "Lanzones"},
+  {"Lansones", "Lanzones"},
+  {"Langsat", "Lanzones"},
+  {"Guyabano", "Guyabano"},
+  {"Guanabana", "Guyabano"},
+  {"Soursop", "Guyabano"},
+  {"Strawberries", "Strawberries"},
+  {"Strawberry", "Strawberries"},
+  {"Melon", "Melon"},
+  {"Cantaloupe", "Melon"},
+  {"Honeydew", "Melon"},
+  {"Muskmelon", "Melon"},
 };
 
 static void comparableFruitNameCopy(const char* raw, char* out, size_t out_size) {
