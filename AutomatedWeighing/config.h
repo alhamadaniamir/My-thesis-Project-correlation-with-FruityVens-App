@@ -55,10 +55,10 @@ extern const float NOISE_FLOOR_GRAMS;
 extern const float WEIGHT_FILTER_ALPHA;
 extern const float FAST_WEIGHT_FILTER_ALPHA;
 extern const float FAST_WEIGHT_DELTA_GRAMS;
-extern const float LOCK_STABLE_TOLERANCE_GRAMS;
+extern const float WEIGHT_DIVISION_GRAMS;
+extern const float WEIGHT_DIVISION_HYSTERESIS_GRAMS;
 extern const uint8_t OBJECT_CONFIRM_SAMPLES;
 extern const uint8_t REMOVE_CONFIRM_SAMPLES;
-extern const uint8_t LOCK_MATCH_SAMPLES;
 extern const unsigned long OBJECT_REDETECT_COOLDOWN_MS;
 
 // --- sales / camera ---

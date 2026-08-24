@@ -27,6 +27,7 @@ constexpr uint8_t PACKET_TYPE_SALE_ACK = kPacketTypeSaleAck;
 
 uint8_t broadcastPeer[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint8_t CALIBRATION_SAMPLE_READS = 8;
+constexpr uint8_t CALIBRATION_REQUIRED_SAMPLES = 5;
 constexpr uint8_t TARE_SAMPLE_READS = 32;
 constexpr unsigned long CALIBRATION_SAMPLE_TIMEOUT_MS = 3000;
 constexpr uint32_t CALIBRATION_EEPROM_MAGIC = 0x4E415531UL;  // "NAU1"
@@ -66,9 +67,12 @@ bool calibrationLearningActive = false;
 unsigned int calibrationLearningSampleCount = 0;
 float calibrationLearningSavedFactor = 0.0;
 bool calibrationLearningSavedReady = false;
-float calibrationLearningWeightedFactorSum = 0.0;
-float calibrationLearningWeightSumGrams = 0.0;
+double calibrationLearningWeightRawSum = 0.0;
+double calibrationLearningWeightSquaredSum = 0.0;
 float calibrationLearningCandidateFactor = 0.0;
+float calibrationLearningKnownWeightsGrams[CALIBRATION_REQUIRED_SAMPLES] = {};
+int32_t calibrationLearningRawDeltas[CALIBRATION_REQUIRED_SAMPLES] = {};
+int32_t calibrationLearningZeroOffset = 0;
 float currentWeightGrams = 0.0;
 unsigned long lastDisplayMs = 0;
 unsigned long lastSerialDiagnosticMs = 0;
@@ -76,9 +80,6 @@ unsigned long lastNau7802UpdateMs = 0;
 unsigned long lastSuccessActionMs = 0;
 unsigned long lastCancelActionMs = 0;
 unsigned long messageUntilMs = 0;
-float lastLockCandidateGrams = 0.0;
-float lockWeightSumGrams = 0.0;
-float lockedWeightGrams = 0.0;
 float filteredWeightGrams = 0.0;
 float lastSensorWeightGrams = 0.0;
 float lastProcessedWeightGrams = 0.0;
@@ -88,13 +89,10 @@ int32_t lastNau7802RawReading = 0;
 bool nau7802Ready = false;
 bool calibrationReady = false;
 bool rtcReady = false;
-bool weightLocked = false;
 bool objectPresent = false;
 bool newScaleData = false;
 uint8_t objectDetectCount = 0;
 uint8_t objectRemoveCount = 0;
-uint8_t lockMatchCount = 0;
-uint8_t lockWeightSampleCount = 0;
 unsigned long nextSaleId = 1;
 unsigned long latestSaleId = 0;
 size_t saleHistoryCount = 0;
@@ -148,8 +146,8 @@ const char* scaleStatusText() {
   if (calibrationLearningActive) return "calibrating";
   if (!calibrationReady) return "uncalibrated";
   if (cancelledObjectActive) return "cancelled";
-  if (weightLocked) return "locked";
   if (objectPresent) return "weighing";
+  if (objectDetectCount > 0) return "detecting";
   return "zero";
 }
 
@@ -178,7 +176,7 @@ void formatDisplayWeight(float weightGrams, char* buffer, size_t bufferSize) {
   }
 
   const float weightKg = weightGrams / 1000.0f;
-  snprintf(buffer, bufferSize, "%.2fkg", weightKg);
+  snprintf(buffer, bufferSize, "%.3fkg", weightKg);
 }
 
 void beginButton(ButtonState &button) {
@@ -228,15 +226,11 @@ void beepBuzzer(uint8_t beepCount) {
 
 void resetWeightState() {
   stopFruitDetection(true);
-  weightLocked = false;
   objectPresent = false;
   cameraScanAttemptedForCurrentObject = false;
   saleConfirmedForCurrentObject = false;
   cancelledObjectActive = false;
-  lockedWeightGrams = 0.0;
   currentWeightGrams = 0.0;
-  lastLockCandidateGrams = 0.0;
-  lockWeightSumGrams = 0.0;
   filteredWeightGrams = 0.0;
   lastSensorWeightGrams = 0.0;
   lastProcessedWeightGrams = 0.0;
@@ -244,8 +238,6 @@ void resetWeightState() {
   lastFilterAlpha = 0.0;
   objectDetectCount = 0;
   objectRemoveCount = 0;
-  lockMatchCount = 0;
-  lockWeightSampleCount = 0;
   objectPresentStartedMs = 0;
 }
 
@@ -354,9 +346,14 @@ void clearCalibrationLearningSession() {
   calibrationLearningSampleCount = 0;
   calibrationLearningSavedFactor = 0.0;
   calibrationLearningSavedReady = false;
-  calibrationLearningWeightedFactorSum = 0.0;
-  calibrationLearningWeightSumGrams = 0.0;
+  calibrationLearningWeightRawSum = 0.0;
+  calibrationLearningWeightSquaredSum = 0.0;
   calibrationLearningCandidateFactor = 0.0;
+  calibrationLearningZeroOffset = 0;
+  for (uint8_t i = 0; i < CALIBRATION_REQUIRED_SAMPLES; i++) {
+    calibrationLearningKnownWeightsGrams[i] = 0.0f;
+    calibrationLearningRawDeltas[i] = 0;
+  }
 }
 
 void beginCalibrationLearning() {
@@ -364,22 +361,29 @@ void beginCalibrationLearning() {
   calibrationLearningSampleCount = 0;
   calibrationLearningSavedFactor = calibration_factor;
   calibrationLearningSavedReady = calibrationReady;
-  calibrationLearningWeightedFactorSum = 0.0;
-  calibrationLearningWeightSumGrams = 0.0;
+  calibrationLearningWeightRawSum = 0.0;
+  calibrationLearningWeightSquaredSum = 0.0;
   calibrationLearningCandidateFactor = calibration_factor;
+  calibrationLearningZeroOffset = loadCell.getZeroOffset();
+  for (uint8_t i = 0; i < CALIBRATION_REQUIRED_SAMPLES; i++) {
+    calibrationLearningKnownWeightsGrams[i] = 0.0f;
+    calibrationLearningRawDeltas[i] = 0;
+  }
 
   resetWeightState();
 
-  Serial.println("Calibration learning started.");
-  Serial.println("Use: t, place known weight, cal add 500");
-  Serial.println("Repeat with other known weights, then use: cal save");
+  Serial.println("Five-point calibration started.");
+  Serial.println("Tare only once before cal start; do not tare between samples.");
+  Serial.println("Recommended: cal add 20, 50, 100, 200, and 500.");
+  Serial.println("Replace the weight and wait for it to settle before each command.");
+  Serial.println("After all five samples, use: cal save");
   Serial.println("Use: cal cancel to return to the last saved factor.");
-  showMessage("Cal learn mode", "Add known wt");
+  showMessage("5-point cal", "Add sample 1/5");
 }
 
 bool hasCalibrationLearningSamples() {
   return calibrationLearningSampleCount > 0 &&
-         calibrationLearningWeightSumGrams > 0.0f &&
+         calibrationLearningWeightSquaredSum > 0.0 &&
          isValidCalibrationFactor(calibrationLearningCandidateFactor);
 }
 
@@ -388,6 +392,8 @@ void printCalibrationLearningStatus() {
   Serial.print(calibrationLearningActive ? "yes" : "no");
   Serial.print(" samples=");
   Serial.print(calibrationLearningSampleCount);
+  Serial.print("/");
+  Serial.print(CALIBRATION_REQUIRED_SAMPLES);
   Serial.print(" current=");
   Serial.print(calibration_factor, 6);
   Serial.print(" ready=");
@@ -399,7 +405,14 @@ void printCalibrationLearningStatus() {
     Serial.print("none");
   }
   Serial.print(" saved=");
-  Serial.println(calibrationLearningSavedFactor, 6);
+  Serial.print(calibrationLearningSavedFactor, 6);
+  Serial.print(" points=");
+  for (uint8_t i = 0; i < calibrationLearningSampleCount; i++) {
+    if (i > 0) Serial.print(",");
+    Serial.print(calibrationLearningKnownWeightsGrams[i], 0);
+    Serial.print("g");
+  }
+  Serial.println();
 }
 
 bool addCalibrationLearningSample(float knownWeightGrams) {
@@ -410,6 +423,26 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
 
   if (!calibrationLearningActive) {
     beginCalibrationLearning();
+  }
+
+  if (calibrationLearningSampleCount >= CALIBRATION_REQUIRED_SAMPLES) {
+    Serial.println("Five calibration samples already accepted. Use cal save or cal cancel.");
+    showMessage("Cal points full", "Send cal save");
+    return false;
+  }
+
+  if (loadCell.getZeroOffset() != calibrationLearningZeroOffset) {
+    Serial.println("Zero offset changed during calibration. Use cal cancel, tare empty, then cal start.");
+    showMessage("Cal zero changed", "Restart cal");
+    return false;
+  }
+
+  for (uint8_t i = 0; i < calibrationLearningSampleCount; i++) {
+    if (fabs(knownWeightGrams - calibrationLearningKnownWeightsGrams[i]) < 0.01f) {
+      Serial.println("That calibration weight was already added. Use a different known weight.");
+      showMessage("Duplicate weight", "Use another mass");
+      return false;
+    }
   }
 
   if (knownWeightGrams < 50.0f) {
@@ -474,11 +507,17 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
     return false;
   }
 
-  calibrationLearningWeightedFactorSum += sampleFactor * knownWeightGrams;
-  calibrationLearningWeightSumGrams += knownWeightGrams;
+  calibrationLearningKnownWeightsGrams[calibrationLearningSampleCount] = knownWeightGrams;
+  calibrationLearningRawDeltas[calibrationLearningSampleCount] =
+    static_cast<int32_t>(rawDelta);
+  calibrationLearningWeightRawSum +=
+    static_cast<double>(knownWeightGrams) * static_cast<double>(rawDelta);
+  calibrationLearningWeightSquaredSum +=
+    static_cast<double>(knownWeightGrams) * static_cast<double>(knownWeightGrams);
   calibrationLearningSampleCount++;
-  calibrationLearningCandidateFactor =
-    calibrationLearningWeightedFactorSum / calibrationLearningWeightSumGrams;
+  calibrationLearningCandidateFactor = static_cast<float>(
+    calibrationLearningWeightRawSum / calibrationLearningWeightSquaredSum
+  );
 
   calibration_factor = calibrationLearningCandidateFactor;
   loadCell.setCalibrationFactor(calibration_factor);
@@ -486,6 +525,8 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
 
   Serial.print("Calibration sample ");
   Serial.print(calibrationLearningSampleCount);
+  Serial.print("/");
+  Serial.print(CALIBRATION_REQUIRED_SAMPLES);
   Serial.print(": known=");
   Serial.print(knownWeightGrams, 2);
   Serial.print("g measuredAvg=");
@@ -496,9 +537,16 @@ bool addCalibrationLearningSample(float knownWeightGrams) {
   Serial.print(sampleFactor, 6);
   Serial.print(" candidate=");
   Serial.println(calibrationLearningCandidateFactor, 6);
-  Serial.println("Not saved yet. Use cal save to store it in EEPROM.");
-
-  showMessage("Cal sample added", "Use cal save");
+  if (calibrationLearningSampleCount == CALIBRATION_REQUIRED_SAMPLES) {
+    Serial.println("All five points accepted. Use cal save to store the fitted factor in EEPROM.");
+    showMessage("5 points accepted", "Send cal save");
+  } else {
+    Serial.print("Add another known weight. Samples remaining: ");
+    Serial.println(CALIBRATION_REQUIRED_SAMPLES - calibrationLearningSampleCount);
+    char progress[21];
+    snprintf(progress, sizeof(progress), "Accepted %u/5", calibrationLearningSampleCount);
+    showMessage("Cal sample added", progress);
+  }
   return true;
 }
 
@@ -506,6 +554,15 @@ void saveCalibrationLearning() {
   if (!calibrationLearningActive || !hasCalibrationLearningSamples()) {
     Serial.println("No calibration samples to save.");
     showMessage("No cal samples");
+    return;
+  }
+
+  if (calibrationLearningSampleCount != CALIBRATION_REQUIRED_SAMPLES) {
+    Serial.print("Calibration needs exactly five different weights. Accepted: ");
+    Serial.println(calibrationLearningSampleCount);
+    char progress[21];
+    snprintf(progress, sizeof(progress), "Accepted %u/5", calibrationLearningSampleCount);
+    showMessage("Need 5 cal points", progress);
     return;
   }
 
@@ -537,8 +594,8 @@ void printScaleHelp() {
   Serial.println("  + or a = increase calibration factor");
   Serial.println("  - or z = decrease calibration factor");
   Serial.println("  r = clear saved calibration");
-  Serial.println("  cal start = start calibration learning");
-  Serial.println("  cal add 500 = add known 500g sample, not saved yet");
+  Serial.println("  cal start = start five-point calibration");
+  Serial.println("  cal add 20 = add one of five different known weights");
   Serial.println("  c 500 = same as cal add 500");
   Serial.println("  cal save = save learned calibration factor");
   Serial.println("  cal cancel = restore last saved calibration factor");
@@ -596,6 +653,36 @@ float readWeightGrams() {
   return lastReturnedWeightGrams;
 }
 
+float quantizeWeightGrams(float weightGrams, float previousWeightGrams) {
+  if (isnan(weightGrams) || isinf(weightGrams) || weightGrams <= 0.0f) {
+    return 0.0f;
+  }
+
+  const float quantizedWeight =
+    round(weightGrams / WEIGHT_DIVISION_GRAMS) * WEIGHT_DIVISION_GRAMS;
+  if (previousWeightGrams <= 0.0f) {
+    return quantizedWeight;
+  }
+
+  const float difference = quantizedWeight - previousWeightGrams;
+  if (fabs(difference) > WEIGHT_DIVISION_GRAMS + 0.001f) {
+    return quantizedWeight;
+  }
+
+  const float halfDivision = WEIGHT_DIVISION_GRAMS * 0.5f;
+  if (difference > 0.0f) {
+    const float switchUpAt =
+      previousWeightGrams + halfDivision + WEIGHT_DIVISION_HYSTERESIS_GRAMS;
+    return weightGrams >= switchUpAt ? quantizedWeight : previousWeightGrams;
+  }
+  if (difference < 0.0f) {
+    const float switchDownAt =
+      previousWeightGrams - halfDivision - WEIGHT_DIVISION_HYSTERESIS_GRAMS;
+    return weightGrams <= switchDownAt ? quantizedWeight : previousWeightGrams;
+  }
+  return previousWeightGrams;
+}
+
 void printScaleDiagnostics() {
   const unsigned long nowMs = millis();
   Serial.print("SCALE status=");
@@ -614,22 +701,20 @@ void printScaleDiagnostics() {
   Serial.print(filteredWeightGrams, 2);
   Serial.print("g current=");
   Serial.print(currentWeightGrams, 2);
-  Serial.print("g locked=");
-  Serial.print(lockedWeightGrams, 2);
-  Serial.print("g avg=");
-  if (lockWeightSampleCount > 0) {
-    Serial.print(lockWeightSumGrams / lockWeightSampleCount, 2);
-  } else {
-    Serial.print("0.00");
-  }
   Serial.print("g filter=");
   Serial.print(lastFilterAlpha, 2);
-  Serial.print(" lock=");
-  Serial.print(static_cast<unsigned int>(lockMatchCount));
+  Serial.print(" present=");
+  Serial.print(objectPresent ? "yes" : "no");
+  Serial.print(" detect=");
+  Serial.print(static_cast<unsigned int>(objectDetectCount));
   Serial.print("/");
-  Serial.print(static_cast<unsigned int>(LOCK_MATCH_SAMPLES));
-  Serial.print(" tol=");
-  Serial.print(LOCK_STABLE_TOLERANCE_GRAMS, 1);
+  Serial.print(static_cast<unsigned int>(OBJECT_CONFIRM_SAMPLES));
+  Serial.print(" remove=");
+  Serial.print(static_cast<unsigned int>(objectRemoveCount));
+  Serial.print("/");
+  Serial.print(static_cast<unsigned int>(REMOVE_CONFIRM_SAMPLES));
+  Serial.print(" division=");
+  Serial.print(WEIGHT_DIVISION_GRAMS, 1);
   Serial.print("g");
   Serial.print(" fruit=");
   Serial.print(currentFruitType);
@@ -772,7 +857,7 @@ void cancelSale(const char* reason) {
   beepBuzzer(2);
 }
 
-void updateLockedWeight() {
+void updateWeight() {
   if (!nau7802Ready || !newScaleData) return;
   newScaleData = false;
 
@@ -787,51 +872,11 @@ void updateLockedWeight() {
   float liveWeightGrams = readWeightGrams();
   const float liveSensorWeightGrams = positiveSensorWeightGrams();
 
-  if (weightLocked) {
-    currentWeightGrams = cancelledObjectActive ? 0.0f : lockedWeightGrams;
-    float removalThresholdGrams = OBJECT_REMOVE_GRAMS;
-    const float postLoadRecoveryThresholdGrams = lockedWeightGrams * 0.05f;
-    if (postLoadRecoveryThresholdGrams > removalThresholdGrams) {
-      removalThresholdGrams = postLoadRecoveryThresholdGrams;
-      if (removalThresholdGrams > 100.0f) {
-        removalThresholdGrams = 100.0f;
-      }
-    }
-
-    if (liveSensorWeightGrams <= removalThresholdGrams) {
-      if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
-    } else {
-      objectRemoveCount = 0;
-    }
-
-    if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
-      resetWeightState();
-      startObjectRedetectCooldown();
-      Serial.println("Object removed - zero display resumed");
-      return;
-    }
-
-    if (!cameraResultReceived &&
-        !cameraDetectionRequested &&
-        !cameraScanAttemptedForCurrentObject &&
-        !calibrationLearningActive &&
-        !cancelledObjectActive &&
-        objectPresentStartedMs != 0 &&
-        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
-      requestFruitDetection();
-    }
-    return;
-  }
-
   if (objectRedetectCooldownActive()) {
     stopFruitDetection(true);
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
     objectRemoveCount = 0;
-    lockMatchCount = 0;
-    lockWeightSampleCount = 0;
-    lastLockCandidateGrams = 0.0;
-    lockWeightSumGrams = 0.0;
     return;
   }
 
@@ -842,10 +887,6 @@ void updateLockedWeight() {
     cameraDetectionRequested = false;
     cameraScanAttemptedForCurrentObject = true;
     objectDetectCount = 0;
-    lockMatchCount = 0;
-    lockWeightSampleCount = 0;
-    lastLockCandidateGrams = 0.0;
-    lockWeightSumGrams = 0.0;
 
     if (liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
       if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
@@ -861,6 +902,31 @@ void updateLockedWeight() {
     return;
   }
 
+  if (objectPresent) {
+    if (liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
+      if (objectRemoveCount < REMOVE_CONFIRM_SAMPLES) objectRemoveCount++;
+      if (objectRemoveCount >= REMOVE_CONFIRM_SAMPLES) {
+        resetWeightState();
+        startObjectRedetectCooldown();
+        Serial.println("Object removed - zero display resumed");
+      }
+      return;
+    }
+
+    objectRemoveCount = 0;
+    currentWeightGrams = quantizeWeightGrams(
+      liveWeightGrams,
+      currentWeightGrams
+    );
+    if (!cameraResultReceived &&
+        !cameraDetectionRequested &&
+        !cameraScanAttemptedForCurrentObject &&
+        millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
+      requestFruitDetection();
+    }
+    return;
+  }
+
   if (liveWeightGrams < OBJECT_DETECT_GRAMS ||
       liveSensorWeightGrams <= OBJECT_REMOVE_GRAMS) {
     stopFruitDetection(true);
@@ -871,64 +937,23 @@ void updateLockedWeight() {
     currentWeightGrams = 0.0;
     objectDetectCount = 0;
     objectRemoveCount = 0;
-    lockMatchCount = 0;
-    lockWeightSampleCount = 0;
-    lastLockCandidateGrams = 0.0;
-    lockWeightSumGrams = 0.0;
     objectPresentStartedMs = 0;
     return;
   }
 
+  if (objectDetectCount < OBJECT_CONFIRM_SAMPLES) objectDetectCount++;
   if (objectDetectCount < OBJECT_CONFIRM_SAMPLES) {
-    objectDetectCount++;
-    currentWeightGrams = 0.0;
-    lockMatchCount = 1;
-    lockWeightSampleCount = 1;
-    lastLockCandidateGrams = liveWeightGrams;
-    lockWeightSumGrams = liveWeightGrams;
+    currentWeightGrams = 0.0f;
     return;
   }
 
-  if (!objectPresent) {
-    objectPresentStartedMs = millis();
-    strlcpy(
-      currentFruitType,
-      calibrationLearningActive ? "Calibrating" : "Settling",
-      sizeof(currentFruitType)
-    );
-  }
+  objectPresentStartedMs = millis();
+  strlcpy(currentFruitType, "Settling", sizeof(currentFruitType));
   objectPresent = true;
-  if (!cameraResultReceived &&
-      !cameraScanAttemptedForCurrentObject &&
-      !calibrationLearningActive &&
-      millis() - objectPresentStartedMs >= CAMERA_START_DELAY_MS) {
-    requestFruitDetection();
-  }
   objectRemoveCount = 0;
-  currentWeightGrams = liveWeightGrams;
-  if (fabs(liveWeightGrams - lastLockCandidateGrams) <= LOCK_STABLE_TOLERANCE_GRAMS) {
-    if (lockMatchCount < LOCK_MATCH_SAMPLES) {
-      lockMatchCount++;
-      lockWeightSampleCount++;
-      lockWeightSumGrams += liveWeightGrams;
-    }
-  } else {
-    lastLockCandidateGrams = liveWeightGrams;
-    lockMatchCount = 1;
-    lockWeightSampleCount = 1;
-    lockWeightSumGrams = liveWeightGrams;
-  }
-
-  if (lockMatchCount >= LOCK_MATCH_SAMPLES) {
-    const float averageStableWeightGrams = lockWeightSumGrams / lockWeightSampleCount;
-    lockedWeightGrams = round(averageStableWeightGrams);
-    currentWeightGrams = lockedWeightGrams;
-    weightLocked = true;
-    Serial.print("Weight locked(g): ");
-    Serial.print(lockedWeightGrams, 0);
-    Serial.print(" avg=");
-    Serial.println(averageStableWeightGrams, 2);
-  }
+  currentWeightGrams = quantizeWeightGrams(liveWeightGrams, 0.0f);
+  Serial.print("Object detected, live display(g): ");
+  Serial.println(currentWeightGrams, 0);
 }
 
 void setupScale() {
@@ -1451,10 +1476,10 @@ void updateDisplay() {
     statusText = "Calibrating";
   } else if (!calibrationReady) {
     statusText = "Cal needed";
-  } else if (weightLocked && !cancelledObjectActive) {
-    statusText = "Locked";
   } else if (objectPresent && !cancelledObjectActive) {
     statusText = "Weighing";
+  } else if (objectDetectCount > 0) {
+    statusText = "Detecting";
   }
 
   char line[21];
@@ -2005,7 +2030,7 @@ void loop() {
   }
 
   if (nau7802Ready) {
-    updateLockedWeight();
+    updateWeight();
   }
 
   handleButtons();

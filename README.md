@@ -64,7 +64,7 @@ Although ESP-NOW is technically peer-to-peer (every board broadcasts to every ot
                     ◄──ESP-NOW PriceUpdate──┘ (price sync)
 ```
 
-1. **Weight detected** — `AutomatedWeighing` filters the NAU7802 stream and locks a stable weight above `OBJECT_DETECT_GRAMS` (9 g).
+1. **Weight detected** — `AutomatedWeighing` continuously filters the NAU7802 stream and reports the live weight in 5 g divisions above `OBJECT_DETECT_GRAMS` (5 g).
 2. **Detection requested** — after `CAMERA_START_DELAY_MS` (1 s) it broadcasts a `"START"` command; the LCD shows `Fruit: Identifying`.
 3. **Image captured** — `ESP32CamSender` snaps the cropped ROI as a JPEG.
 4. **Fruit identified** — the JPEG is POSTed to the Vercel backend, which asks Gemini and returns one allowed label, for example `{"fruit":"Mango Carabao"}`. A mango is always reported as a variety (`Mango Carabao`, `Indian Mango`, `Apple Mango`); an unclear fruit comes back as `Unknown`.
@@ -162,26 +162,32 @@ Each sketch has its own config. Update these before flashing:
 | `t` | Tare / zero the scale |
 | `+` / `-` | Increase / decrease calibration factor |
 | `r` | Reset calibration to default |
-| `c 500` | Add a known 500 g calibration sample |
-| `cal save` | Save the new calibration factor |
+| `cal start` | Start a new five-point calibration session |
+| `cal add 20` | Add one known weight as a calibration point |
+| `cal save` | Save after five different points are accepted |
 | `fruit Mango` | Manually set the fruit name (skips camera) |
 
 After installing the NAU7802, calibrate it before recording sales:
 
 1. Power on with the platform completely empty; startup performs an automatic tare.
-2. Open Serial Monitor at 115200 baud and send `t` once more with the platform empty.
-3. Place a known weight, such as exactly 500 g, in the center and wait for it to settle.
-4. Send `c 500`, then send `cal save`.
-5. Remove the weight, send `t`, and verify several known weights.
+2. Open Serial Monitor at 115200 baud, remove everything, and send `t` once.
+3. Send `cal start`. Do not tare again until all five samples have been added.
+4. Place 20 g, wait for it to settle, then send `cal add 20`.
+5. Replace it in turn with 50 g, 100 g, 200 g, and 500 g, sending the matching `cal add` command after each weight settles.
+6. Send `cal save`, remove all weight, and send `t` once more.
+7. Check the independent 10 g, 150 g, and 300 g weights without adding them as calibration points.
 
 ## Key Tuning Parameters (AutomatedWeighing)
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `OBJECT_DETECT_GRAMS` | 9 g | Minimum weight to count as an object |
-| `OBJECT_REMOVE_GRAMS` | 4 g | Residual weight treated as removed |
+| `OBJECT_DETECT_GRAMS` | 5 g | Minimum weight to count as an object |
+| `OBJECT_REMOVE_GRAMS` | 2 g | Residual weight treated as removed |
 | `OBJECT_REDETECT_COOLDOWN_MS` | 2000 ms | Delay before detecting another object after removal |
-| `LOCK_MATCH_SAMPLES` | 10 | Stable samples required to lock a weight |
+| `DISPLAY_INTERVAL_MS` | 150 ms | LCD refresh interval for a faster visible response |
+| `WEIGHT_FILTER_ALPHA` | 0.30 | Continuous smoothing for a responsive live reading |
+| `WEIGHT_DIVISION_GRAMS` | 5 g | Rounds every displayed and recorded weight to the nearest division |
+| `WEIGHT_DIVISION_HYSTERESIS_GRAMS` | 0.25 g | Prevents fractional noise from flickering between two 5 g values |
 | `CAMERA_START_DELAY_MS` | 1000 ms | Delay before requesting detection |
 | `CAMERA_DETECTION_TIMEOUT_MS` | 22000 ms | Retry camera detection after this |
 | `FRUIT_DETECTION_CONFIDENCE` | 0.0 | Min confidence to accept a label |

@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../..,../..,../..,../..,../..,../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/marzomir/.arduino15/packages/esp32/hardware/esp32/3.3.8,/home/marzomir/.arduino15/packages/esp32/hardware/esp32/3.3.8",
+  "otherLibrariesFolders": "/home/marzomir/Arduino/libraries",
+  "sketchLocation": "/home/marzomir/Arduino/My-thesis-Project-correlation-with-FruityVens-App/ESP32Receiver"
+}

@@ -21,7 +21,7 @@ const int calVal_eepromAddress = 16;
 const float DEFAULT_CALIBRATION_FACTOR = 1.0f;
 const float CALIBRATION_STEP = 1.0f;
 
-const unsigned long DISPLAY_INTERVAL_MS = 300;
+const unsigned long DISPLAY_INTERVAL_MS = 150;
 const unsigned long SERIAL_DIAGNOSTIC_INTERVAL_MS = 500;
 const unsigned long BUTTON_DEBOUNCE_MS = 40;
 const unsigned long BUTTON_COOLDOWN_MS = 300;
@@ -38,16 +38,16 @@ const unsigned long FIREBASE_UPLOAD_FAILURE_BACKOFF_MS = 15000;
 const unsigned int BUZZER_BEEP_MS = 220;
 const unsigned int BUZZER_PAUSE_MS = 120;
 
-const float OBJECT_DETECT_GRAMS = 9.0f;
-const float OBJECT_REMOVE_GRAMS = 4.0f;
+const float OBJECT_DETECT_GRAMS = 5.0f;
+const float OBJECT_REMOVE_GRAMS = 2.0f;
 const float NOISE_FLOOR_GRAMS = 2.0f;
-const float WEIGHT_FILTER_ALPHA = 0.45f;
-const float FAST_WEIGHT_FILTER_ALPHA = 0.85f;
+const float WEIGHT_FILTER_ALPHA = 0.30f;
+const float FAST_WEIGHT_FILTER_ALPHA = 0.70f;
 const float FAST_WEIGHT_DELTA_GRAMS = 20.0f;
-const float LOCK_STABLE_TOLERANCE_GRAMS = 1.0f;
+const float WEIGHT_DIVISION_GRAMS = 5.0f;
+const float WEIGHT_DIVISION_HYSTERESIS_GRAMS = 0.25f;
 const uint8_t OBJECT_CONFIRM_SAMPLES = 3;
 const uint8_t REMOVE_CONFIRM_SAMPLES = 3;
-const uint8_t LOCK_MATCH_SAMPLES = 10;
 const unsigned long OBJECT_REDETECT_COOLDOWN_MS = 2000;
 
 const float FRUIT_DETECTION_CONFIDENCE = 0.0f;
